@@ -1,0 +1,107 @@
+import type {
+	IAuthenticateGeneric,
+	ICredentialTestRequest,
+	ICredentialType,
+	INodeProperties,
+} from 'n8n-workflow';
+
+export class WeaviateApi implements ICredentialType {
+	name = 'weaviateApi';
+
+	displayName = 'Weaviate Credentials';
+
+	documentationUrl = 'https://docs.n8n.io/integrations/builtin/credentials/weaviate/';
+
+	properties: INodeProperties[] = [
+		{
+			displayName: 'Weaviate Cloud Host',
+			name: 'weaviate_cloud_host',
+			description: 'The URL of a Weaviate Cloud instance. Leave empty if not using Weaviate Cloud.',
+			placeholder: 'https://your-cluster.weaviate.cloud',
+			type: 'string',
+			required: false,
+			default: '',
+		},
+		{
+			displayName: 'Weaviate Api Key',
+			name: 'weaviate_api_key',
+			description:
+				'The API key for the Weaviate instance. Used for both Cloud and Custom Connection.',
+			type: 'string',
+			typeOptions: { password: true },
+			required: false,
+			default: '',
+		},
+		{
+			displayName: 'Custom Connection HTTP Host',
+			name: 'custom_connection_http_host',
+			description: 'The host of your Weaviate instance. Leave empty if using Weaviate Cloud.',
+			type: 'string',
+			required: false,
+			default: 'weaviate',
+		},
+		{
+			displayName: 'Custom Connection HTTP Port',
+			name: 'custom_connection_http_port',
+			description: 'The port of your Weaviate instance. Leave empty if using Weaviate Cloud.',
+			type: 'number',
+			required: false,
+			default: 8080,
+		},
+		{
+			displayName: 'Custom Connection HTTP Secure',
+			name: 'custom_connection_http_secure',
+			description:
+				'Whether to use a secure connection for HTTP. Leave empty if using Weaviate Cloud.',
+			type: 'boolean',
+			required: false,
+			default: false,
+		},
+		{
+			displayName: 'Custom Connection gRPC Host',
+			name: 'custom_connection_grpc_host',
+			description: 'The gRPC host of your Weaviate instance. Leave empty if using Weaviate Cloud.',
+			type: 'string',
+			required: false,
+			default: 'weaviate',
+		},
+		{
+			displayName: 'Custom Connection gRPC Port',
+			name: 'custom_connection_grpc_port',
+			description: 'The gRPC port of your Weaviate instance. Leave empty if using Weaviate Cloud.',
+			type: 'number',
+			required: false,
+			default: 50051,
+		},
+		{
+			displayName: 'Custom Connection gRPC Secure',
+			name: 'custom_connection_grpc_secure',
+			description:
+				'Whether to use a secure connection for gRPC. Leave empty if using Weaviate Cloud.',
+			type: 'boolean',
+			required: false,
+			default: false,
+		},
+	];
+
+	// authenticate: IAuthenticateGeneric = {
+	// 	type: 'generic',
+	// 	properties: {
+	// 		headers: {
+	// 			'api-key': '={{$credentials.apiKey}}',
+	// 		},
+	// 	},
+	// };
+
+	test: ICredentialTestRequest = {
+		request: {
+			baseURL:
+				'={{$if($credentials.weaviate_cloud_host, $credentials.weaviate_cloud_host,   $if($credentials.custom_connection_http_secure, "https", "http") + "://" + $credentials.custom_connection_http_host + ":" + $credentials.custom_connection_http_port)}}',
+			url: '/v1/nodes',
+			headers: {
+				Authorization:
+					'={{$if($credentials.weaviate_api_key, "Bearer " + $credentials.weaviate_api_key, undefined)}}',
+			},
+		},
+	};
+}
