@@ -1,4 +1,4 @@
-import weaviate, { WeaviateClient } from 'weaviate-client';
+import weaviate, { ProxiesParams, TimeoutParams, WeaviateClient } from 'weaviate-client';
 
 export type WeaviateCredential = {
 	weaviate_cloud_url: string;
@@ -13,14 +13,20 @@ export type WeaviateCredential = {
 
 export async function createWeaviateClient(
 	credentials: WeaviateCredential,
+	timeout?: TimeoutParams,
+	proxies?: ProxiesParams,
+	skipInitChecks: boolean = false,
 ): Promise<WeaviateClient> {
 	if (credentials.weaviate_cloud_url) {
-		const weaviateClient: WeaviateClient = await weaviate.connectToWeaviateCloud(
-			credentials.weaviate_cloud_url,
-			{
-				authCredentials: new weaviate.ApiKey(credentials.weaviate_api_key),
-			},
-		);
+		let cloud_url = credentials.weaviate_cloud_url.trim();
+
+		if (!/^https?:\/\//i.test(cloud_url)) {
+			cloud_url = 'https://' + cloud_url;
+		}
+
+		const weaviateClient: WeaviateClient = await weaviate.connectToWeaviateCloud(cloud_url, {
+			authCredentials: new weaviate.ApiKey(credentials.weaviate_api_key),
+		});
 		return weaviateClient;
 	} else {
 		const weaviateClient: WeaviateClient = await weaviate.connectToCustom({
@@ -33,6 +39,9 @@ export async function createWeaviateClient(
 			authCredentials: credentials.weaviate_api_key
 				? new weaviate.ApiKey(credentials.weaviate_api_key)
 				: undefined,
+			timeout,
+			proxies,
+			skipInitChecks,
 		});
 		return weaviateClient;
 	}

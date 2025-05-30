@@ -84,20 +84,12 @@ export class WeaviateApi implements ICredentialType {
 		},
 	];
 
-	// authenticate: IAuthenticateGeneric = {
-	// 	type: 'generic',
-	// 	properties: {
-	// 		headers: {
-	// 			'api-key': '={{$credentials.apiKey}}',
-	// 		},
-	// 	},
-	// };
-
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL:
-				'={{$if($credentials.weaviate_cloud_host, $credentials.weaviate_cloud_host,   $if($credentials.custom_connection_http_secure, "https", "http") + "://" + $credentials.custom_connection_http_host + ":" + $credentials.custom_connection_http_port)}}',
+				'={{$credentials.weaviate_cloud_host?$credentials.weaviate_cloud_host.startsWith("http://") || $credentials.weaviate_cloud_host.startsWith("https://")?$credentials.weaviate_cloud_host:"https://" + $credentials.weaviate_cloud_host:($credentials.custom_connection_http_secure ? "https" : "http") + "://" + $credentials.custom_connection_http_host + ":" + $credentials.custom_connection_http_port }}',
 			url: '/v1/nodes',
+			disableFollowRedirect: false,
 			headers: {
 				Authorization:
 					'={{$if($credentials.weaviate_api_key, "Bearer " + $credentials.weaviate_api_key, undefined)}}',

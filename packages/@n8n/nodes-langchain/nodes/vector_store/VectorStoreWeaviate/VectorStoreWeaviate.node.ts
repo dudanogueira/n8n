@@ -2,7 +2,12 @@ import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type { Embeddings } from '@langchain/core/embeddings';
 import { WeaviateStore } from '@langchain/weaviate';
 import type { WeaviateLibArgs } from '@langchain/weaviate';
-import type { IDataObject, INodeProperties } from 'n8n-workflow';
+import type {
+	IDataObject,
+	INodeProperties,
+	INodePropertyCollection,
+	INodePropertyOptions,
+} from 'n8n-workflow';
 
 import { createWeaviateClient } from './Weaviate.utils';
 import type { WeaviateCredential } from './Weaviate.utils';
@@ -10,11 +15,12 @@ import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVec
 import { weaviateCollectionsSearch } from '../shared/createVectorStoreNode/methods/listSearch';
 import { weaviateCollectionRLC } from '../shared/descriptions';
 
+import type { ProxiesParams, TimeoutParams } from 'weaviate-client';
+
 // TODO:
-// Add skipInitChecks option to WeaviateStore
-// move tenant to sharedFields
-// add option timeout options for query, insert and init
-// add option grpc proxies
+// Add json with filter
+// allow both with http(s):// and without in weaviate cloud url
+// so if you copy and paste it just works
 
 class ExtendedWeaviateVectorStore extends WeaviateStore {
 	private static defaultFilter: IDataObject = {};
@@ -42,6 +48,65 @@ class ExtendedWeaviateVectorStore extends WeaviateStore {
 
 const sharedFields: INodeProperties[] = [weaviateCollectionRLC];
 
+const shared_options: Array<INodePropertyOptions | INodeProperties | INodePropertyCollection> = [
+	{
+		displayName: 'Tenant Name',
+		name: 'tenant',
+		type: 'string',
+		default: undefined,
+		validateType: 'string',
+		description: 'Tenant Name. Collection must have been created with tenant support enabled.',
+	},
+	{
+		displayName: 'Text Key',
+		name: 'textKey',
+		type: 'string',
+		default: 'text',
+		validateType: 'string',
+		description: 'The key in the document that contains the embedded text',
+	},
+	{
+		displayName: 'Skip Init Checks',
+		name: 'skip_init_checks',
+		type: 'boolean',
+		default: false,
+		validateType: 'boolean',
+		description: 'Whether to skip init checks while instantiating the client',
+	},
+	{
+		displayName: 'Init Timeout',
+		name: 'timeout_init',
+		type: 'number',
+		default: 2,
+		validateType: 'number',
+		description: 'Number of timeout seconds for initial checks',
+	},
+	{
+		displayName: 'Insert Timeout',
+		name: 'timeout_insert',
+		type: 'number',
+		default: 90,
+		validateType: 'number',
+		description: 'Number of timeout seconds for inserts',
+	},
+	{
+		displayName: 'Query Timeout',
+		name: 'timeout_query',
+		type: 'number',
+		default: 30,
+		validateType: 'number',
+		description: 'Number of timeout seconds for queries',
+	},
+	{
+		displayName: 'GRPC Proxy',
+		name: 'proxy_grpc',
+		type: 'string',
+		default: undefined,
+		validateType: 'string',
+		description: 'Proxy to use for GRPC',
+	},
+];
+
 const insertFields: INodeProperties[] = [
 	{
 		displayName: 'Options',
@@ -50,23 +115,7 @@ const insertFields: INodeProperties[] = [
 		placeholder: 'Add Option',
 		default: {},
 		options: [
-			{
-				displayName: 'Tenant Name',
-				name: 'tenant',
-				type: 'string',
-				default: undefined,
-				validateType: 'string',
-				description:
-					'Tenant Name. If set, any query to this collection must also include a Tenant.',
-			},
-			{
-				displayName: 'Text Key',
-				name: 'textKey',
-				type: 'string',
-				default: 'text',
-				validateType: 'string',
-				description: 'The key in the document that contains the embedded text',
-			},
+			...shared_options,
 			{
 				displayName: 'Clear Data',
 				name: 'clearStore',
@@ -99,22 +148,7 @@ const retrieveFields: INodeProperties[] = [
 				description:
 					'Filter pageContent or metadata using this <a href="https://weaviate.io/" target="_blank">filtering syntax</a>',
 			},
-			{
-				displayName: 'Tenant Name',
-				name: 'tenant',
-				type: 'string',
-				default: undefined,
-				validateType: 'string',
-				description: 'Tenant Name. Collection must have been created with tenant support enabled.',
-			},
-			{
-				displayName: 'Text Key',
-				name: 'textKey',
-				type: 'string',
-				default: 'text',
-				validateType: 'string',
-				description: 'The key in the document that contains the embedded text',
-			},
+			...shared_options,
 		],
 	},
 ];
@@ -149,11 +183,31 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 		const options = context.getNodeParameter('options', itemIndex, {}) as {
 			tenant?: string;
 			textKey?: string;
+			timeout_init: number;
+			timeout_insert: number;
+			timeout_query: number;
+			skip_init_checks: boolean;
+			proxy_grpc: string;
 		};
 
 		const credentials = await context.getCredentials('weaviateApi');
 
-		const client = await createWeaviateClient(credentials as WeaviateCredential);
+		const timeout = {
+			query: options.timeout_query,
+			init: options.timeout_init,
+			insert: options.timeout_insert,
+		};
+
+		const proxies = {
+			grpc: options.proxy_grpc,
+		};
+
+		const client = await createWeaviateClient(
+			credentials as WeaviateCredential,
+			timeout as TimeoutParams,
+			proxies as ProxiesParams,
+			options.skip_init_checks as boolean,
+		);
 
 		const config: WeaviateLibArgs = {
 			client,
