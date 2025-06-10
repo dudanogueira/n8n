@@ -1,4 +1,6 @@
-import weaviate, { ProxiesParams, TimeoutParams, WeaviateClient } from 'weaviate-client';
+import { OperationalError } from 'n8n-workflow';
+import type { GeoRangeFilter, ProxiesParams, TimeoutParams, WeaviateClient } from 'weaviate-client';
+import weaviate from 'weaviate-client';
 
 export type WeaviateCredential = {
 	weaviate_cloud_endpoint: string;
@@ -44,4 +46,44 @@ export async function createWeaviateClient(
 		});
 		return weaviateClient;
 	}
+}
+
+export type WeaviateFilterUnit = {
+	path: string[];
+	operator: string;
+	valueString?: string;
+	valueTextArray?: string[];
+	valueBoolean?: boolean;
+	valueNumber?: number;
+	valueGeoCoordinates?: GeoRangeFilter;
+};
+
+// This function now returns a filter builder from the collection, not Filters
+export function returnFilter(filter: WeaviateFilterUnit) {
+	const filter_object = weaviate.filter;
+	const operator = filter.operator.toLowerCase();
+	const property = filter_object.byProperty(filter.path[0]);
+	if (operator === 'equal' && filter.valueString) {
+		return property.equal(filter.valueString);
+	} else if (operator === 'like' && filter.valueString) {
+		return property.like(filter.valueString);
+	} else if (operator === 'containsany' && filter.valueTextArray) {
+		return property.containsAny(filter.valueTextArray);
+	} else if (operator === 'containsall' && filter.valueTextArray) {
+		return property.containsAll(filter.valueTextArray);
+	} else if (operator === 'greaterthan' && filter.valueNumber) {
+		return property.greaterThan(filter.valueNumber);
+	} else if (operator === 'lessthan' && filter.valueNumber) {
+		return property.lessThan(filter.valueNumber);
+	} else if (operator === 'isnull' && filter.valueBoolean !== undefined) {
+		return property.isNull(filter.valueBoolean);
+	} else if (operator === 'withingeorange') {
+		if (!filter.valueGeoCoordinates) {
+			throw new OperationalError(
+				"valueGeoCoordinates must be provided for 'withinGeoRange' operator.",
+			);
+		}
+		return property.withinGeoRange(filter.valueGeoCoordinates);
+	}
+	throw new OperationalError(`Unsupported operator: ${filter.operator}`);
 }

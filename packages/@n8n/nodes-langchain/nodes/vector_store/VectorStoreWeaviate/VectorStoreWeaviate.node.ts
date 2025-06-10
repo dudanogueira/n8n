@@ -2,47 +2,41 @@ import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type { Embeddings } from '@langchain/core/embeddings';
 import { WeaviateStore } from '@langchain/weaviate';
 import type { WeaviateLibArgs } from '@langchain/weaviate';
-import type {
-	IDataObject,
-	INodeProperties,
-	INodePropertyCollection,
-	INodePropertyOptions,
-} from 'n8n-workflow';
-
-import { createWeaviateClient } from './Weaviate.utils';
-import type { WeaviateCredential } from './Weaviate.utils';
+import type { INodeProperties, INodePropertyCollection, INodePropertyOptions } from 'n8n-workflow';
+import { Filters, type ProxiesParams, type TimeoutParams } from 'weaviate-client';
+import type { WeaviateCredential, WeaviateFilterUnit } from './Weaviate.utils';
+import { createWeaviateClient, returnFilter } from './Weaviate.utils';
 import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVectorStoreNode';
 import { weaviateCollectionsSearch } from '../shared/createVectorStoreNode/methods/listSearch';
 import { weaviateCollectionRLC } from '../shared/descriptions';
 
-import type { ProxiesParams, TimeoutParams } from 'weaviate-client';
-
 // TODO:
 // Add json with filter
-// allow both with http(s):// and without in weaviate cloud url
-// so if you copy and paste it just works
+// validate textKey
+// use metadatakeys
 
 class ExtendedWeaviateVectorStore extends WeaviateStore {
-	private static defaultFilter: IDataObject = {};
-
 	static async fromExistingCollection(
 		embeddings: Embeddings,
 		args: WeaviateLibArgs,
-		defaultFilter: IDataObject = {},
 	): Promise<WeaviateStore> {
-		ExtendedWeaviateVectorStore.defaultFilter = defaultFilter;
 		return await super.fromExistingIndex(embeddings, args);
 	}
 
 	async similaritySearch(
 		query: string,
 		k: number,
-		filter?: IDataObject,
+		filter?: WeaviateFilterUnit[],
 		callbacks?: Callbacks | undefined,
 	) {
-		//const mergedFilter = { ...ExtendedWeaviateVectorStore.defaultFilter, ...filter };
-		const mergedFilter = undefined;
-		return await super.similaritySearch(query, k, mergedFilter, callbacks);
+		if (filter) {
+			const result_filters = filter.map((filter_item: WeaviateFilterUnit) =>
+				returnFilter(filter_item),
+			);
+			return await super.similaritySearch(query, k, Filters.and(...result_filters), callbacks);
+		} else {
+			return await super.similaritySearch(query, k, undefined, callbacks);
+		}
 	}
 }
 
