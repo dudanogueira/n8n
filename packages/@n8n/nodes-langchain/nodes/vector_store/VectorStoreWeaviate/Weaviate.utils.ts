@@ -1,8 +1,6 @@
-import { ApplicationError, OperationalError } from 'n8n-workflow';
+import { OperationalError } from 'n8n-workflow';
 import type { GeoRangeFilter, ProxiesParams, TimeoutParams, WeaviateClient } from 'weaviate-client';
 import weaviate, { Filters } from 'weaviate-client';
-
-import { LoggerProxy as Logger } from 'n8n-workflow';
 
 export type WeaviateCredential = {
 	weaviate_cloud_endpoint: string;

@@ -9,17 +9,13 @@ import type {
 	INodePropertyOptions,
 } from 'n8n-workflow';
 import { LoggerProxy as Logger } from 'n8n-workflow';
-import { Filters, type ProxiesParams, type TimeoutParams } from 'weaviate-client';
+import { type ProxiesParams, type TimeoutParams } from 'weaviate-client';
+
 import type { WeaviateCompositeFilter, WeaviateCredential } from './Weaviate.utils';
 import { createWeaviateClient, parseCompositeFilter } from './Weaviate.utils';
 import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVectorStoreNode';
 import { weaviateCollectionsSearch } from '../shared/createVectorStoreNode/methods/listSearch';
 import { weaviateCollectionRLC } from '../shared/descriptions';
-
-// TODO:
-// Add json with filter
-// validate textKey
-// use metadatakeys
 
 class ExtendedWeaviateVectorStore extends WeaviateStore {
 	private static defaultFilter: WeaviateCompositeFilter;
@@ -203,6 +199,7 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 			proxy_grpc: string;
 			metadataKeys?: string;
 		};
+		// check if textKey is valid
 
 		const credentials = await context.getCredentials('weaviateApi');
 
