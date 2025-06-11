@@ -14070,10 +14070,6 @@ packages:
   walker@1.0.8:
     resolution: {integrity: sha512-ts/8E8l5b7kY0vlWLewOkDXMmPdLcVV4GmOQLyxuSswIJsweeFZtAsMF7k1Nszz+TYBQrlYRmzOnr398y1JemQ==}
 
-  weaviate-client@3.5.5:
-    resolution: {integrity: sha512-wAjJtJmBQn2KiTPkfUGEzddBIbySpN0y0wAcYPWDCBXVjXqf0UOExujFJ+QeeRp+AjHk15B6BmUaUX9NHVLzsw==}
-    engines: {node: '>=18.0.0'}
-
   weaviate-client@3.6.1:
     resolution: {integrity: sha512-C/sVYLqLuRQn2FeP3YQFNSOV61gNNtswNDRnb117ZfweSU/DIGAYeZZn63DpNI11qDSWTS3Cbz/aQjUzZXbA6Q==}
     engines: {node: '>=18.0.0'}
@@ -17427,7 +17423,7 @@ snapshots:
     dependencies:
       '@langchain/core': 0.3.30(openai@4.78.1(encoding@0.1.13)(zod@3.24.1))
       uuid: 10.0.0
-      weaviate-client: 3.5.5(encoding@0.1.13)
+      weaviate-client: 3.6.1(encoding@0.1.13)
     transitivePeerDependencies:
       - encoding
 
@@ -28754,19 +28750,6 @@ snapshots:
   walker@1.0.8:
     dependencies:
       makeerror: 1.0.12
-
-  weaviate-client@3.5.5(encoding@0.1.13):
-    dependencies:
-      abort-controller-x: 0.4.3
-      graphql: 16.11.0
-      graphql-request: 6.1.0(encoding@0.1.13)(graphql@16.11.0)
-      long: 5.3.2
-      nice-grpc: 2.1.12
-      nice-grpc-client-middleware-retry: 3.1.11
-      nice-grpc-common: 2.0.2
-      uuid: 9.0.1
-    transitivePeerDependencies:
-      - encoding
 
   weaviate-client@3.6.1(encoding@0.1.13):
     dependencies:

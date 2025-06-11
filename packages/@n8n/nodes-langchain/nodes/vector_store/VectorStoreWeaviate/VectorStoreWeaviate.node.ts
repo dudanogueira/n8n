@@ -2,10 +2,16 @@ import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type { Embeddings } from '@langchain/core/embeddings';
 import { WeaviateStore } from '@langchain/weaviate';
 import type { WeaviateLibArgs } from '@langchain/weaviate';
-import type { INodeProperties, INodePropertyCollection, INodePropertyOptions } from 'n8n-workflow';
+import type {
+	IDataObject,
+	INodeProperties,
+	INodePropertyCollection,
+	INodePropertyOptions,
+} from 'n8n-workflow';
+import { LoggerProxy as Logger } from 'n8n-workflow';
 import { Filters, type ProxiesParams, type TimeoutParams } from 'weaviate-client';
-import type { WeaviateCredential, WeaviateFilterUnit } from './Weaviate.utils';
-import { createWeaviateClient, returnFilter } from './Weaviate.utils';
+import type { WeaviateCompositeFilter, WeaviateCredential } from './Weaviate.utils';
+import { createWeaviateClient, parseCompositeFilter } from './Weaviate.utils';
 import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVectorStoreNode';
 import { weaviateCollectionsSearch } from '../shared/createVectorStoreNode/methods/listSearch';
 import { weaviateCollectionRLC } from '../shared/descriptions';
@@ -16,24 +22,29 @@ import { weaviateCollectionRLC } from '../shared/descriptions';
 // use metadatakeys
 
 class ExtendedWeaviateVectorStore extends WeaviateStore {
+	private static defaultFilter: WeaviateCompositeFilter;
+
 	static async fromExistingCollection(
 		embeddings: Embeddings,
 		args: WeaviateLibArgs,
+		defaultFilter: WeaviateCompositeFilter,
 	): Promise<WeaviateStore> {
+		ExtendedWeaviateVectorStore.defaultFilter = defaultFilter;
 		return await super.fromExistingIndex(embeddings, args);
 	}
 
 	async similaritySearch(
 		query: string,
 		k: number,
-		filter?: WeaviateFilterUnit[],
+		filter?: IDataObject,
 		callbacks?: Callbacks | undefined,
 	) {
-		if (filter) {
-			const result_filters = filter.map((filter_item: WeaviateFilterUnit) =>
-				returnFilter(filter_item),
-			);
-			return await super.similaritySearch(query, k, Filters.and(...result_filters), callbacks);
+		const given_filter = ExtendedWeaviateVectorStore.defaultFilter;
+		Logger.debug('FILTER' + JSON.stringify(filter));
+		Logger.debug('given_filter' + JSON.stringify(given_filter));
+		if (given_filter) {
+			const composed_filter = parseCompositeFilter(given_filter) as this['FilterType'];
+			return await super.similaritySearch(query, k, composed_filter, callbacks);
 		} else {
 			return await super.similaritySearch(query, k, undefined, callbacks);
 		}
@@ -130,17 +141,25 @@ const retrieveFields: INodeProperties[] = [
 		default: {},
 		options: [
 			{
-				displayName: 'Search Filter',
+				displayName: 'Search Filters',
 				name: 'searchFilterJson',
 				type: 'json',
 				typeOptions: {
 					rows: 5,
 				},
 				default:
-					'{\n  "should": [\n    {\n      "key": "metadata.batch",\n      "match": {\n        "value": 12345\n      }\n    }\n  ]\n}',
+					'{\n  "OR": [\n    {\n        "path": ["pdf_info_Author"],\n        "operator": "Equal",\n        "valueString": "Elis"\n    },\n    {\n        "path": ["pdf_info_Author"],\n        "operator": "Equal",\n        "valueString": "Pinnacle"\n    }    \n  ]\n}',
 				validateType: 'object',
 				description:
 					'Filter pageContent or metadata using this <a href="https://weaviate.io/" target="_blank">filtering syntax</a>',
+			},
+			{
+				displayName: 'Metadata Keys',
+				name: 'metadataKeys',
+				type: 'string',
+				default: 'source,page',
+				validateType: 'string',
+				description: 'Select the metadata to retrieve along the content',
 			},
 			...shared_options,
 		],
@@ -182,6 +201,7 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 			timeout_query: number;
 			skip_init_checks: boolean;
 			proxy_grpc: string;
+			metadataKeys?: string;
 		};
 
 		const credentials = await context.getCredentials('weaviateApi');
@@ -203,11 +223,13 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 			options.skip_init_checks as boolean,
 		);
 
+		const metadataKeys = options.metadataKeys ? options.metadataKeys.split(',') : [];
 		const config: WeaviateLibArgs = {
 			client,
 			indexName: collection,
 			tenant: options.tenant ? options.tenant : undefined,
 			textKey: options.textKey ? options.textKey : 'text',
+			metadataKeys: metadataKeys as string[] | undefined,
 		};
 
 		return await ExtendedWeaviateVectorStore.fromExistingCollection(embeddings, config, filter);
@@ -221,9 +243,12 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 			tenant?: string;
 			textKey?: string;
 			clearStore?: boolean;
+			metadataKeys?: string;
 		};
 
 		const credentials = await context.getCredentials('weaviateApi');
+
+		const metadataKeys = options.metadataKeys ? options.metadataKeys.split(',') : [];
 
 		const client = await createWeaviateClient(credentials as WeaviateCredential);
 
@@ -232,6 +257,7 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 			indexName: collectionName,
 			tenant: options.tenant ? options.tenant : undefined,
 			textKey: options.textKey ? options.textKey : 'text',
+			metadataKeys: metadataKeys as string[] | undefined,
 		};
 
 		if (options.clearStore) {

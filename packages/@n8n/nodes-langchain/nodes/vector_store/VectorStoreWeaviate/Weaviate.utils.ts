@@ -1,6 +1,8 @@
-import { OperationalError } from 'n8n-workflow';
+import { ApplicationError, OperationalError } from 'n8n-workflow';
 import type { GeoRangeFilter, ProxiesParams, TimeoutParams, WeaviateClient } from 'weaviate-client';
-import weaviate from 'weaviate-client';
+import weaviate, { Filters } from 'weaviate-client';
+
+import { LoggerProxy as Logger } from 'n8n-workflow';
 
 export type WeaviateCredential = {
 	weaviate_cloud_endpoint: string;
@@ -47,8 +49,7 @@ export async function createWeaviateClient(
 		return weaviateClient;
 	}
 }
-
-export type WeaviateFilterUnit = {
+type WeaviateFilterUnit = {
 	path: string[];
 	operator: string;
 	valueString?: string;
@@ -58,32 +59,83 @@ export type WeaviateFilterUnit = {
 	valueGeoCoordinates?: GeoRangeFilter;
 };
 
-// This function now returns a filter builder from the collection, not Filters
-export function returnFilter(filter: WeaviateFilterUnit) {
-	const filter_object = weaviate.filter;
-	const operator = filter.operator.toLowerCase();
-	const property = filter_object.byProperty(filter.path[0]);
-	if (operator === 'equal' && filter.valueString) {
-		return property.equal(filter.valueString);
-	} else if (operator === 'like' && filter.valueString) {
-		return property.like(filter.valueString);
-	} else if (operator === 'containsany' && filter.valueTextArray) {
-		return property.containsAny(filter.valueTextArray);
-	} else if (operator === 'containsall' && filter.valueTextArray) {
-		return property.containsAll(filter.valueTextArray);
-	} else if (operator === 'greaterthan' && filter.valueNumber) {
-		return property.greaterThan(filter.valueNumber);
-	} else if (operator === 'lessthan' && filter.valueNumber) {
-		return property.lessThan(filter.valueNumber);
-	} else if (operator === 'isnull' && filter.valueBoolean !== undefined) {
-		return property.isNull(filter.valueBoolean);
-	} else if (operator === 'withingeorange') {
-		if (!filter.valueGeoCoordinates) {
-			throw new OperationalError(
-				"valueGeoCoordinates must be provided for 'withinGeoRange' operator.",
-			);
-		}
-		return property.withinGeoRange(filter.valueGeoCoordinates);
+export type WeaviateCompositeFilter = { AND: WeaviateFilterUnit[] } | { OR: WeaviateFilterUnit[] };
+
+type WeaviatePropertyFilter = {
+	equal: (value: string | number | boolean) => unknown;
+	like: (value: string) => unknown;
+	containsAny: (value: string[]) => unknown;
+	containsAll: (value: string[]) => unknown;
+	greaterThan: (value: number) => unknown;
+	lessThan: (value: number) => unknown;
+	isNull: (value: boolean) => unknown;
+	withinGeoRange: (value: GeoRangeFilter) => unknown;
+};
+
+function buildFilter(filter: WeaviateFilterUnit): unknown {
+	const { path, operator } = filter;
+	const property = weaviate.filter.byProperty(path[0]) as WeaviatePropertyFilter;
+
+	switch (operator.toLowerCase()) {
+		case 'equal':
+			if (filter.valueString !== undefined) return property.equal(filter.valueString);
+			if (filter.valueNumber !== undefined) return property.equal(filter.valueNumber);
+			if (filter.valueBoolean !== undefined) return property.equal(filter.valueBoolean);
+			break;
+
+		case 'like':
+			if (filter.valueString === undefined) {
+				throw new OperationalError("Missing 'valueString' for 'like' operator.");
+			}
+			return property.like(filter.valueString);
+
+		case 'containsany':
+			if (filter.valueTextArray === undefined) {
+				throw new OperationalError("Missing 'valueTextArray' for 'containsAny' operator.");
+			}
+			return property.containsAny(filter.valueTextArray);
+
+		case 'containsall':
+			if (filter.valueTextArray === undefined) {
+				throw new OperationalError("Missing 'valueTextArray' for 'containsAll' operator.");
+			}
+			return property.containsAll(filter.valueTextArray);
+
+		case 'greaterthan':
+			if (filter.valueNumber === undefined) {
+				throw new OperationalError("Missing 'valueNumber' for 'greaterThan' operator.");
+			}
+			return property.greaterThan(filter.valueNumber);
+
+		case 'lessthan':
+			if (filter.valueNumber === undefined) {
+				throw new OperationalError("Missing 'valueNumber' for 'lessThan' operator.");
+			}
+			return property.lessThan(filter.valueNumber);
+
+		case 'isnull':
+			if (filter.valueBoolean === undefined) {
+				throw new OperationalError("Missing 'valueBoolean' for 'isNull' operator.");
+			}
+			return property.isNull(filter.valueBoolean);
+
+		case 'withingeorange':
+			if (!filter.valueGeoCoordinates) {
+				throw new OperationalError("Missing 'valueGeoCoordinates' for 'withinGeoRange' operator.");
+			}
+			return property.withinGeoRange(filter.valueGeoCoordinates);
+
+		default:
+			throw new OperationalError(`Unsupported operator: ${operator}`);
 	}
-	throw new OperationalError(`Unsupported operator: ${filter.operator}`);
+}
+
+export function parseCompositeFilter(filter: WeaviateCompositeFilter): unknown {
+	if ('AND' in filter) {
+		return Filters.and(...filter.AND.map(parseCompositeFilter));
+	} else if ('OR' in filter) {
+		return Filters.or(...filter.OR.map(parseCompositeFilter));
+	} else {
+		return buildFilter(filter);
+	}
 }
