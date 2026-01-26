@@ -64,6 +64,7 @@ describe('createVectorStoreNode', () => {
 		],
 		retrieveFields: [],
 		updateFields: [],
+		deleteFields: [],
 		getVectorStoreClient: jest.fn().mockReturnValue(vectorStore),
 	});
 
@@ -396,7 +397,7 @@ describe('createVectorStoreNode', () => {
 				const nodeType = new VectorStoreNodeType();
 
 				await expect(nodeType.execute.call(executeContext)).rejects.toThrow(
-					'Only the "load", "update", "insert", and "retrieve-as-tool" operation modes are supported with execute',
+					'Only the "load", "update", "insert", "delete", and "retrieve-as-tool" operation modes are supported with execute',
 				);
 			});
 		});

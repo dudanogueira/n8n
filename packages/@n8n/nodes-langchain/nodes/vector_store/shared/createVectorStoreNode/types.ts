@@ -14,7 +14,13 @@ import type {
 	NodeParameterValueType,
 } from 'n8n-workflow';
 
-export type NodeOperationMode = 'insert' | 'load' | 'retrieve' | 'update' | 'retrieve-as-tool';
+export type NodeOperationMode =
+	| 'insert'
+	| 'load'
+	| 'retrieve'
+	| 'update'
+	| 'retrieve-as-tool'
+	| 'delete';
 
 export interface NodeMeta {
 	displayName: string;
@@ -53,6 +59,7 @@ export interface VectorStoreNodeConstructorArgs<T extends VectorStore = VectorSt
 	loadFields?: INodeProperties[];
 	retrieveFields?: INodeProperties[];
 	updateFields?: INodeProperties[];
+	deleteFields?: INodeProperties[];
 
 	/**
 	 * Function to populate the vector store with documents

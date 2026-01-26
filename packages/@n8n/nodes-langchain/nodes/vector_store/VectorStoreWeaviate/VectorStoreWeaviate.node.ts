@@ -57,6 +57,16 @@ class ExtendedWeaviateVectorStore extends WeaviateStore {
 		return base;
 	}
 
+	async delete(params: { ids?: string[]; filter?: IDataObject }): Promise<void> {
+		const processedParams = {
+			...params,
+			filter: params.filter
+				? parseCompositeFilter(params.filter as WeaviateCompositeFilter)
+				: undefined,
+		};
+		return await super.delete(processedParams);
+	}
+
 	async similaritySearchVectorWithScore(query: number[], k: number, filter?: IDataObject) {
 		filter = filter ?? this.defaultFilter;
 		const args = this.args;
@@ -280,6 +290,37 @@ const retrieveFields: INodeProperties[] = [
 	},
 ];
 
+const deleteFields: INodeProperties[] = [
+	{
+		displayName: 'Options',
+		name: 'options',
+		type: 'collection',
+		placeholder: 'Add Option',
+		default: {},
+		options: [
+			{
+				displayName: 'Search Filters',
+				name: 'searchFilterJson',
+				type: 'json',
+				typeOptions: {
+					rows: 5,
+				},
+				default:
+					'{\n  "OR": [\n    {\n        "path": ["pdf_info_Author"],\n        "operator": "Equal",\n        "valueString": "Elis"\n    },\n    {\n        "path": ["pdf_info_Author"],\n        "operator": "Equal",\n        "valueString": "Pinnacle"\n    }    \n  ]\n}',
+				validateType: 'object',
+				description:
+					'Filter documents using this <a href="https://weaviate.io/" target="_blank">filtering syntax</a>',
+				displayOptions: {
+					show: {
+						'/deleteBy': ['filter'],
+					},
+				},
+			},
+			...shared_options,
+		],
+	},
+];
+
 export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateVectorStore>({
 	meta: {
 		displayName: 'Weaviate Vector Store',
@@ -294,12 +335,14 @@ export class VectorStoreWeaviate extends createVectorStoreNode<ExtendedWeaviateV
 				required: true,
 			},
 		],
+		operationModes: ['load', 'insert', 'retrieve', 'retrieve-as-tool', 'delete'],
 	},
 	methods: {
 		listSearch: { weaviateCollectionsSearch },
 	},
 	loadFields: retrieveFields,
 	insertFields,
+	deleteFields,
 	sharedFields,
 	retrieveFields,
 	async getVectorStoreClient(context, filter, embeddings, itemIndex) {

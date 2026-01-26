@@ -29,6 +29,16 @@ export function isUpdateSupported<T extends VectorStore>(
 }
 
 /**
+ * Checks if the delete operation is supported for a specific vector store
+ * A vector store supports deletes if it explicitly includes 'delete' in its operationModes
+ */
+export function isDeleteSupported<T extends VectorStore>(
+	args: VectorStoreNodeConstructorArgs<T>,
+): boolean {
+	return args.meta.operationModes?.includes('delete') ?? false;
+}
+
+/**
  * Returns the operation mode options enabled for a specific vector store
  * Filters the full list of operation modes based on what's enabled for this vector store
  */

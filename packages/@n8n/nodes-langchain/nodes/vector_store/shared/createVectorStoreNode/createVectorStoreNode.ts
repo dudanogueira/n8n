@@ -18,6 +18,7 @@ import {
 	handleLoadOperation,
 	handleInsertOperation,
 	handleUpdateOperation,
+	handleDeleteOperation,
 	handleRetrieveOperation,
 	handleRetrieveAsToolOperation,
 	handleRetrieveAsToolExecuteOperation,
@@ -82,6 +83,12 @@ export const createVectorStoreNode = <T extends VectorStore = VectorStore>(
 			((parameters) => {
 				const mode = parameters?.mode;
 				const useReranker = parameters?.useReranker;
+				
+				// Delete mode only needs Main input
+				if (mode === 'delete') {
+					return [{ displayName: "", type: "${NodeConnectionTypes.Main}"}];
+				}
+				
 				const inputs = [{ displayName: "Embedding", type: "${NodeConnectionTypes.AiEmbedding}", required: true, maxConnections: 1}]
 
 				if (['load', 'retrieve', 'retrieve-as-tool'].includes(mode) && useReranker) {
@@ -252,6 +259,47 @@ export const createVectorStoreNode = <T extends VectorStore = VectorStore>(
 				]),
 				...transformDescriptionForOperationMode(args.retrieveFields ?? [], 'retrieve'),
 				...transformDescriptionForOperationMode(args.updateFields ?? [], 'update'),
+				// Delete operation fields
+				{
+					displayName: 'Delete By',
+					name: 'deleteBy',
+					type: 'options',
+					options: [
+						{
+							name: 'ID',
+							value: 'id',
+							description: 'Delete documents by their IDs',
+						},
+						{
+							name: 'Filter',
+							value: 'filter',
+							description: 'Delete documents matching a filter',
+						},
+					],
+					default: 'id',
+					description: 'How to identify documents to delete',
+					displayOptions: {
+						show: {
+							mode: ['delete'],
+						},
+					},
+				},
+				{
+					displayName: 'IDs',
+					name: 'ids',
+					type: 'string',
+					default: '',
+					required: true,
+					description: 'Comma-separated list of document IDs to delete',
+					placeholder: 'id1, id2, id3',
+					displayOptions: {
+						show: {
+							mode: ['delete'],
+							deleteBy: ['id'],
+						},
+					},
+				},
+				...transformDescriptionForOperationMode(args.deleteFields ?? [], 'delete'),
 			],
 		};
 
@@ -263,6 +311,13 @@ export const createVectorStoreNode = <T extends VectorStore = VectorStore>(
 		 */
 		async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 			const mode = this.getNodeParameter('mode', 0) as NodeOperationMode;
+
+			// Delete mode doesn't require embeddings
+			if (mode === 'delete') {
+				const resultData = await handleDeleteOperation(this, args);
+				return [resultData];
+			}
+
 			// Get the embeddings model connected to this node
 			const embeddings = (await this.getInputConnectionData(
 				NodeConnectionTypes.AiEmbedding,
@@ -311,7 +366,7 @@ export const createVectorStoreNode = <T extends VectorStore = VectorStore>(
 
 			throw new NodeOperationError(
 				this.getNode(),
-				'Only the "load", "update", "insert", and "retrieve-as-tool" operation modes are supported with execute',
+				'Only the "load", "update", "insert", "delete", and "retrieve-as-tool" operation modes are supported with execute',
 			);
 		}
 

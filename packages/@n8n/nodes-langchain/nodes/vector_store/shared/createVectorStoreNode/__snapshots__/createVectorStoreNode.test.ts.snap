@@ -42,6 +42,12 @@ exports[`createVectorStoreNode retrieve mode supplies vector store as data 1`] =
 			((parameters) => {
 				const mode = parameters?.mode;
 				const useReranker = parameters?.useReranker;
+				
+				// Delete mode only needs Main input
+				if (mode === 'delete') {
+					return [{ displayName: "", type: "main"}];
+				}
+				
 				const inputs = [{ displayName: "Embedding", type: "ai_embedding", required: true, maxConnections: 1}]
 
 				if (['load', 'retrieve', 'retrieve-as-tool'].includes(mode) && useReranker) {
@@ -292,6 +298,51 @@ exports[`createVectorStoreNode retrieve mode supplies vector store as data 1`] =
         },
       },
       "name": "loadField",
+    },
+    {
+      "default": "id",
+      "description": "How to identify documents to delete",
+      "displayName": "Delete By",
+      "displayOptions": {
+        "show": {
+          "mode": [
+            "delete",
+          ],
+        },
+      },
+      "name": "deleteBy",
+      "options": [
+        {
+          "description": "Delete documents by their IDs",
+          "name": "ID",
+          "value": "id",
+        },
+        {
+          "description": "Delete documents matching a filter",
+          "name": "Filter",
+          "value": "filter",
+        },
+      ],
+      "type": "options",
+    },
+    {
+      "default": "",
+      "description": "Comma-separated list of document IDs to delete",
+      "displayName": "IDs",
+      "displayOptions": {
+        "show": {
+          "deleteBy": [
+            "id",
+          ],
+          "mode": [
+            "delete",
+          ],
+        },
+      },
+      "name": "ids",
+      "placeholder": "id1, id2, id3",
+      "required": true,
+      "type": "string",
     },
   ],
   "version": [
