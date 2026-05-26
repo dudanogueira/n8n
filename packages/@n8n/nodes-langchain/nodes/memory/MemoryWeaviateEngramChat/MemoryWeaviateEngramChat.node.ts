@@ -28,6 +28,10 @@ interface EngramConfig {
 	userId: string;
 	groupId?: string;
 	searchLimit: number;
+	// Default 30000ms matches the Engram Python SDK (httpx timeout=30.0). Node's
+	// undici default connect timeout is only 10s, which is what was triggering
+	// UND_ERR_CONNECT_TIMEOUT on cold connections from n8n.
+	timeoutMs: number;
 	// Captured at supplyData time so loadMemoryVariables({}) can still drive a
 	// semantic search — the n8n AI Agent calls loadMemoryVariables with no
 	// `values`, so we can't read the current input from there.
@@ -63,30 +67,85 @@ async function engramFetch(
 	url: string,
 	apiKey: string,
 	body: unknown,
+	timeoutMs: number,
 	method: 'POST' | 'GET' = 'POST',
 ): Promise<unknown> {
-	const response = await fetch(url, {
-		method,
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${apiKey}`,
-		},
-		body: method === 'GET' ? undefined : JSON.stringify(body),
-	});
-	if (!response.ok) {
-		const text = await response.text().catch(() => '');
-		// This helper runs inside langchain memory classes, not an n8n execute
-		// block, so the standard NodeOperationError (which requires a node ref)
-		// isn't usable here. Throw a plain Error and let the caller surface it.
-		// eslint-disable-next-line n8n-nodes-base/node-execute-block-wrong-error-thrown
-		throw new Error(`Engram API error ${response.status}: ${text || response.statusText}`);
+	// One-shot retry on transient connect timeouts. undici has a 10s default
+	// connect timeout and sometimes the first connection to a new host fails
+	// (cold pool, IPv6 fallback, etc.) but a second attempt succeeds.
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			const response = await fetch(url, {
+				method,
+				headers: {
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${apiKey}`,
+				},
+				body: method === 'GET' ? undefined : JSON.stringify(body),
+				// Match the Engram Python SDK default (httpx timeout=30.0) — node's
+				// undici has a 10s connect timeout by default which is too short
+				// for some networks.
+				signal: AbortSignal.timeout(timeoutMs),
+			});
+			if (!response.ok) {
+				const text = await response.text().catch(() => '');
+				// This helper runs inside langchain memory classes, not an n8n
+				// execute block, so NodeOperationError isn't usable here.
+				// eslint-disable-next-line n8n-nodes-base/node-execute-block-wrong-error-thrown
+				throw new Error(`Engram API error ${response.status}: ${text || response.statusText}`);
+			}
+			if (response.status === 204) return undefined;
+			const contentType = response.headers.get('content-type') ?? '';
+			if (contentType.includes('application/json')) {
+				return (await response.json()) as unknown;
+			}
+			return undefined;
+		} catch (error) {
+			lastError = error;
+			const code =
+				(error as { code?: string; cause?: { code?: string } }).code ??
+				(error as { cause?: { code?: string } }).cause?.code;
+			// Only retry connect-level transient failures, never HTTP errors.
+			const retriable =
+				code === 'UND_ERR_CONNECT_TIMEOUT' ||
+				code === 'ECONNRESET' ||
+				code === 'ETIMEDOUT' ||
+				code === 'EAI_AGAIN';
+			if (!retriable || attempt === 1) throw error;
+			await new Promise((r) => setTimeout(r, 500));
+		}
 	}
-	if (response.status === 204) return undefined;
-	const contentType = response.headers.get('content-type') ?? '';
-	if (contentType.includes('application/json')) {
-		return (await response.json()) as unknown;
+	throw lastError;
+}
+
+function logFetchFailure(
+	scope: 'search' | 'add',
+	url: string,
+	error: unknown,
+	extra: Record<string, unknown>,
+): void {
+	const e = error as Error & { cause?: unknown; code?: string };
+	const cause = e.cause as
+		| { code?: string; errno?: string; syscall?: string; message?: string; hostname?: string }
+		| undefined;
+	const details = {
+		scope,
+		url,
+		message: e.message,
+		code: e.code ?? cause?.code,
+		errno: cause?.errno,
+		syscall: cause?.syscall,
+		hostname: cause?.hostname,
+		causeMessage: cause?.message,
+		...extra,
+	};
+	// eslint-disable-next-line no-console
+	console.warn(`[WeaviateEngram] ${scope} failed:`, JSON.stringify(details));
+	if (e.stack) {
+		// eslint-disable-next-line no-console
+		console.warn(`[WeaviateEngram] ${scope} stack:`, e.stack.split('\n').slice(0, 6).join('\n'));
 	}
-	return undefined;
 }
 
 export class EngramChatMessageHistory extends BaseListChatMessageHistory {
@@ -126,7 +185,22 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 			user_id: this.config.userId,
 		};
 		if (this.config.groupId) payload.group = this.config.groupId;
-		await engramFetch(`${this.config.baseUrl}/v1/memories`, this.config.apiKey, payload);
+		try {
+			await engramFetch(
+				`${this.config.baseUrl}/v1/memories`,
+				this.config.apiKey,
+				payload,
+				this.config.timeoutMs,
+			);
+		} catch (error) {
+			logFetchFailure('add', `${this.config.baseUrl}/v1/memories`, error, {
+				userIdLength: this.config.userId?.length,
+				groupIdSet: Boolean(this.config.groupId),
+				messageCount: messages.length,
+				timeoutMs: this.config.timeoutMs,
+			});
+			throw error;
+		}
 	}
 
 	async clear(): Promise<void> {
@@ -217,6 +291,7 @@ export class EngramMemory extends BaseChatMemory {
 				`${this.config.baseUrl}/v1/memories/search`,
 				this.config.apiKey,
 				payload,
+				this.config.timeoutMs,
 			)) as EngramSearchResponse | undefined;
 
 			const items = response?.memories ?? [];
@@ -228,8 +303,12 @@ export class EngramMemory extends BaseChatMemory {
 			// Don't take the agent down — but make the failure visible in n8n's
 			// execution log so misconfigured user_id / group / retrieval_type
 			// issues are diagnosable instead of silently degrading to no memory.
-			// eslint-disable-next-line no-console
-			console.warn('[WeaviateEngram] search failed:', (error as Error).message);
+			logFetchFailure('search', `${this.config.baseUrl}/v1/memories/search`, error, {
+				userIdLength: this.config.userId?.length,
+				groupIdSet: Boolean(this.config.groupId),
+				queryLength: query.length,
+				timeoutMs: this.config.timeoutMs,
+			});
 			return [];
 		}
 	}
@@ -325,6 +404,14 @@ export class MemoryWeaviateEngramChat implements INodeType {
 						default: 'output',
 						description: 'Key used to read the AI output when saving the turn to Engram',
 					},
+					{
+						displayName: 'Request Timeout (Ms)',
+						name: 'timeoutMs',
+						type: 'number',
+						default: 30000,
+						description:
+							'Maximum time to wait for an Engram request before aborting. Matches the Engram Python SDK default (30s). Increase if you see UND_ERR_CONNECT_TIMEOUT in the n8n log.',
+					},
 				],
 			},
 		],
@@ -350,6 +437,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			memoryKey?: string;
 			inputKey?: string;
 			outputKey?: string;
+			timeoutMs?: number;
 		};
 
 		const baseUrl = (credentials.baseUrl ?? 'https://api.engram.weaviate.io').replace(/\/+$/, '');
@@ -375,6 +463,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				userId: sessionId,
 				groupId: groupId || undefined,
 				searchLimit: options.searchLimit ?? 10,
+				timeoutMs: options.timeoutMs ?? 30000,
 				currentInput,
 			},
 			memoryKey: options.memoryKey ?? 'chat_history',

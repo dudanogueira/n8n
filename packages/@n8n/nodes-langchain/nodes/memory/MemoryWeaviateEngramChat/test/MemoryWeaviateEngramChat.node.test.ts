@@ -53,6 +53,7 @@ describe('EngramChatMessageHistory', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 10,
+		timeoutMs: 30000,
 	};
 
 	it('POSTs a human message to /v1/memories with input.conversation.messages and user_id', async () => {
@@ -155,6 +156,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 5,
+		timeoutMs: 30000,
 	};
 
 	it('POSTs the current input as the search query and returns Engram memories as system messages', async () => {
@@ -283,6 +285,7 @@ describe('EngramMemory.saveContext', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 10,
+		timeoutMs: 30000,
 	};
 
 	it('pushes the input and output as a single bulk add to Engram', async () => {
