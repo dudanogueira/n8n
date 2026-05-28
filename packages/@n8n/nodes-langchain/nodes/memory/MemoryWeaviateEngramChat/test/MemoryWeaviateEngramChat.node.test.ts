@@ -24,6 +24,9 @@ interface CapturedBody {
 	group_id?: string;
 	query?: string;
 	retrieval_config?: { retrieval_type: string; limit: number };
+	properties?: Record<string, string>;
+	topics?: string[];
+	root?: string;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -82,6 +85,7 @@ describe('EngramChatMessageHistory', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 10,
+		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
 	};
 
@@ -177,6 +181,106 @@ describe('EngramChatMessageHistory', () => {
 
 		await expect(history.addMessage(new HumanMessage('hi'))).rejects.toThrow(/403/);
 	});
+
+	it('extracts Engram error detail from problem+json bodies', async () => {
+		fetchMock.mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					status: 422,
+					title: 'Unprocessable Entity',
+					detail: 'group "myproject" not found',
+				}),
+				{ status: 422, headers: { 'content-type': 'application/problem+json' } },
+			),
+		);
+		const history = new EngramChatMessageHistory(config);
+
+		await expect(history.addMessage(new HumanMessage('hi'))).rejects.toThrow(
+			/group "myproject" not found/,
+		);
+	});
+
+	it('forwards group + properties context to the n8n logger on failure', async () => {
+		const logger = {
+			warn: vi.fn<(message: string, meta?: Record<string, unknown>) => void>(),
+		};
+		fetchMock.mockResolvedValueOnce(
+			new Response(JSON.stringify({ status: 422, detail: 'group "x" not found' }), {
+				status: 422,
+				headers: { 'content-type': 'application/problem+json' },
+			}),
+		);
+
+		const history = new EngramChatMessageHistory({
+			...config,
+			groupId: 'x',
+			storeProperties: { env: 'prod' },
+			root: 'custom',
+			logger,
+		});
+
+		await expect(history.addMessage(new HumanMessage('hi'))).rejects.toThrow();
+		expect(logger.warn).toHaveBeenCalledTimes(1);
+		const [message, meta] = logger.warn.mock.calls[0];
+		expect(message).toContain('add failed');
+		expect(meta).toMatchObject({
+			scope: 'add',
+			status: 422,
+			group: 'x',
+			root: 'custom',
+			storeProperties: { env: 'prod' },
+		});
+	});
+
+	it('sends properties when storeProperties is configured', async () => {
+		const history = new EngramChatMessageHistory({
+			...config,
+			storeProperties: { env: 'prod', channel: 'slack' },
+		});
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ env: 'prod', channel: 'slack' });
+	});
+
+	it('sends root when configured', async () => {
+		const history = new EngramChatMessageHistory({
+			...config,
+			root: 'custom-pipeline',
+		});
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.root).toBe('custom-pipeline');
+	});
+
+	it('omits properties and root by default', async () => {
+		const history = new EngramChatMessageHistory(config);
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+		expect(body.root).toBeUndefined();
+	});
+
+	it('polls /v1/runs/{run_id} when waitForCompletion is true', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ run_id: 'run-123', status: 'running' }));
+		fetchMock.mockResolvedValueOnce(jsonResponse({ run_id: 'run-123', status: 'completed' }));
+
+		const history = new EngramChatMessageHistory({
+			...config,
+			waitForCompletion: true,
+		});
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		expect(fetchMock.mock.calls).toHaveLength(2);
+		expect(lastFetchCall().url).toBe(`${BASE_URL}/v1/runs/run-123`);
+		expect(lastFetchCall().init.method).toBe('GET');
+	});
 });
 
 describe('EngramMemory.loadMemoryVariables', () => {
@@ -185,6 +289,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 5,
+		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
 	};
 
@@ -240,6 +345,86 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		const variables = await memory.loadMemoryVariables({ input: 'whatever' });
 
 		expect(variables.chat_history).toEqual([]);
+	});
+
+	it('silently treats 422 "user not found" as a cold-start empty result', async () => {
+		const logger = {
+			warn: vi.fn<(message: string, meta?: Record<string, unknown>) => void>(),
+		};
+		fetchMock.mockResolvedValueOnce(
+			new Response(JSON.stringify({ status: 422, detail: 'user "User222" not found' }), {
+				status: 422,
+				headers: { 'content-type': 'application/problem+json' },
+			}),
+		);
+
+		const memory = new EngramMemory({
+			config: { ...config, logger },
+			returnMessages: true,
+		});
+		const variables = await memory.loadMemoryVariables({ input: 'whatever' });
+
+		expect(variables.chat_history).toEqual([]);
+		// Critically: nothing logged — this is an expected cold-start path,
+		// not a misconfiguration the user needs to see.
+		expect(logger.warn).not.toHaveBeenCalled();
+	});
+
+	it('still logs 422 errors that are not "user not found"', async () => {
+		const logger = {
+			warn: vi.fn<(message: string, meta?: Record<string, unknown>) => void>(),
+		};
+		fetchMock.mockResolvedValueOnce(
+			new Response(JSON.stringify({ status: 422, detail: 'group "ghost" not found' }), {
+				status: 422,
+				headers: { 'content-type': 'application/problem+json' },
+			}),
+		);
+
+		const memory = new EngramMemory({
+			config: { ...config, logger },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		expect(logger.warn).toHaveBeenCalledTimes(1);
+	});
+
+	it('logs structured search-failure context to the n8n logger', async () => {
+		const logger = {
+			warn: vi.fn<(message: string, meta?: Record<string, unknown>) => void>(),
+		};
+		fetchMock.mockResolvedValueOnce(
+			new Response(JSON.stringify({ status: 422, detail: 'group "ghost" not found' }), {
+				status: 422,
+				headers: { 'content-type': 'application/problem+json' },
+			}),
+		);
+
+		const memory = new EngramMemory({
+			config: {
+				...config,
+				groupId: 'ghost',
+				retrievalType: 'bm25',
+				searchTopics: ['support'],
+				logger,
+			},
+			returnMessages: true,
+		});
+		const variables = await memory.loadMemoryVariables({ input: 'whatever' });
+
+		expect(variables.chat_history).toEqual([]);
+		expect(logger.warn).toHaveBeenCalledTimes(1);
+		const [message, meta] = logger.warn.mock.calls[0];
+		expect(message).toContain('search failed');
+		expect(message).toContain('group "ghost" not found');
+		expect(meta).toMatchObject({
+			scope: 'search',
+			status: 422,
+			group: 'ghost',
+			retrievalType: 'bm25',
+			searchTopics: ['support'],
+		});
 	});
 
 	it('skips the search when no input is provided', async () => {
@@ -304,6 +489,59 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		expect(variables.history).toBeDefined();
 		expect(variables.chat_history).toBeUndefined();
 	});
+
+	it.each(['vector', 'bm25', 'hybrid'] as const)(
+		'sends retrieval_type=%s from config',
+		async (retrievalType) => {
+			fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+			const memory = new EngramMemory({
+				config: { ...config, retrievalType },
+				returnMessages: true,
+			});
+			await memory.loadMemoryVariables({ input: 'q' });
+
+			const body = parseBody(lastFetchCall().init);
+			expect(body.retrieval_config?.retrieval_type).toBe(retrievalType);
+		},
+	);
+
+	it('sends topics array when configured', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: { ...config, searchTopics: ['support', 'onboarding'] },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.topics).toEqual(['support', 'onboarding']);
+	});
+
+	it('sends search properties map when configured', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: { ...config, searchProperties: { tenant: 'acme' } },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ tenant: 'acme' });
+	});
+
+	it('omits topics and properties when not configured', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({ config, returnMessages: true });
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.topics).toBeUndefined();
+		expect(body.properties).toBeUndefined();
+	});
 });
 
 describe('EngramMemory.saveContext', () => {
@@ -312,6 +550,7 @@ describe('EngramMemory.saveContext', () => {
 		baseUrl: BASE_URL,
 		userId: USER_ID,
 		searchLimit: 10,
+		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
 	};
 
@@ -363,6 +602,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		overrides: {
 			sessionId?: string;
 			groupId?: string;
+			retrievalType?: 'hybrid' | 'vector' | 'bm25';
 			options?: Record<string, unknown>;
 			credentials?: Record<string, unknown>;
 		} = {},
@@ -386,6 +626,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 			if (param === 'sessionIdType') return 'customKey';
 			if (param === 'sessionKey') return overrides.sessionId ?? USER_ID;
 			if (param === 'groupId') return overrides.groupId ?? '';
+			if (param === 'retrievalType') return overrides.retrievalType ?? 'hybrid';
 			if (param === 'options') return overrides.options ?? {};
 			return undefined;
 		});
@@ -417,7 +658,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		const ctx = createCtx({
 			sessionId: 's1',
 			groupId: 'team-a',
-			options: { searchLimit: 3, memoryKey: 'history' },
+			options: { searchLimit: 3, advanced: { memoryKey: 'history' } },
 		});
 
 		const { response } = await node.supplyData.call(ctx, 0);
@@ -451,5 +692,93 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		const ctx = createCtx({ sessionId: '' });
 
 		await expect(node.supplyData.call(ctx, 0)).rejects.toThrow(/Key parameter is empty/);
+	});
+
+	it('forwards retrievalType from the top-level parameter', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({ sessionId: 's1', retrievalType: 'vector' });
+
+		const { response } = await node.supplyData.call(ctx, 0);
+
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		await (response as EngramMemory).loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.retrieval_config?.retrieval_type).toBe('vector');
+	});
+
+	it('converts fixedCollection storeProperties to a flat map', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({
+			sessionId: 's1',
+			options: {
+				storeProperties: {
+					property: [
+						{ key: 'env', value: 'prod' },
+						{ key: 'channel', value: 'slack' },
+					],
+				},
+			},
+		});
+
+		const { response } = await node.supplyData.call(ctx, 0);
+		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ env: 'prod', channel: 'slack' });
+	});
+
+	it('converts fixedCollection searchProperties to a flat map', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({
+			sessionId: 's1',
+			options: {
+				searchProperties: {
+					property: [{ key: 'tenant', value: 'acme' }],
+				},
+			},
+		});
+
+		const { response } = await node.supplyData.call(ctx, 0);
+
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		await (response as EngramMemory).loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ tenant: 'acme' });
+	});
+
+	it('forwards searchTopics from options', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({
+			sessionId: 's1',
+			options: { searchTopics: ['support', 'onboarding'] },
+		});
+
+		const { response } = await node.supplyData.call(ctx, 0);
+
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		await (response as EngramMemory).loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.topics).toEqual(['support', 'onboarding']);
+	});
+
+	it('drops empty fixedCollection rows', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({
+			sessionId: 's1',
+			options: {
+				storeProperties: {
+					property: [{ key: '', value: 'ignored' }],
+				},
+			},
+		});
+
+		const { response } = await node.supplyData.call(ctx, 0);
+		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
 	});
 });

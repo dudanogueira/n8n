@@ -49,7 +49,7 @@ export class WeaviateEngramApi implements ICredentialType {
 			body: {
 				query: 'connection test',
 				retrieval_config: {
-					retrieval_type: 'fetch',
+					retrieval_type: 'hybrid',
 					limit: 1,
 				},
 			},
