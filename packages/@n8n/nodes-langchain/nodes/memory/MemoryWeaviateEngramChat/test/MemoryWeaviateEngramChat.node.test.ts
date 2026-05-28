@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any */
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
-import type { INode, ISupplyDataFunctions } from 'n8n-workflow';
+import { jsonParse, type INode, type ISupplyDataFunctions } from 'n8n-workflow';
+import { type MockedFunction } from 'vitest';
 import { mock } from 'vitest-mock-extended';
 
 import {
@@ -12,6 +12,19 @@ import {
 const BASE_URL = 'https://api.engram.weaviate.io';
 const API_KEY = 'test-api-key';
 const USER_ID = 'alice@example.com';
+
+interface CapturedBody {
+	user_id?: string;
+	input?: {
+		conversation?: {
+			messages?: Array<{ role: string; content: string }>;
+		};
+	};
+	group?: string;
+	group_id?: string;
+	query?: string;
+	retrieval_config?: { retrieval_type: string; limit: number };
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -27,20 +40,36 @@ function emptyOkResponse(): Response {
 	});
 }
 
-function lastFetchCall(): { url: string; init: RequestInit } {
-	const calls = (global.fetch as any).mock.calls;
-	const [url, init] = calls[calls.length - 1];
-	return { url: String(url), init };
+let fetchMock: MockedFunction<typeof fetch>;
+
+function urlToString(url: RequestInfo | URL): string {
+	if (typeof url === 'string') return url;
+	if (url instanceof URL) return url.toString();
+	return url.url;
 }
 
-function parseBody(init: RequestInit): any {
-	return JSON.parse(String(init.body));
+function lastFetchCall(): { url: string; init: RequestInit } {
+	const calls = fetchMock.mock.calls;
+	const [url, init] = calls[calls.length - 1];
+	return { url: urlToString(url), init: init ?? {} };
+}
+
+function parseBody(init: RequestInit): CapturedBody {
+	if (typeof init.body !== 'string') {
+		throw new Error('Expected string body in test');
+	}
+	return jsonParse<CapturedBody>(init.body);
 }
 
 beforeEach(() => {
 	// Use mockImplementation so each call returns a fresh Response (Response
 	// bodies are single-use and would throw on subsequent reads otherwise).
-	global.fetch = vi.fn().mockImplementation(async () => emptyOkResponse()) as any;
+	fetchMock = vi.fn<typeof fetch>();
+	fetchMock.mockImplementation(async () => {
+		await Promise.resolve();
+		return emptyOkResponse();
+	});
+	global.fetch = fetchMock;
 });
 
 afterEach(() => {
@@ -80,7 +109,7 @@ describe('EngramChatMessageHistory', () => {
 		await history.addMessage(new AIMessage('here is an answer'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.input.conversation.messages).toEqual([
+		expect(body.input?.conversation?.messages).toEqual([
 			{ role: 'assistant', content: 'here is an answer' },
 		]);
 	});
@@ -91,7 +120,7 @@ describe('EngramChatMessageHistory', () => {
 		await history.addMessage(new SystemMessage('be concise'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.input.conversation.messages).toEqual([{ role: 'system', content: 'be concise' }]);
+		expect(body.input?.conversation?.messages).toEqual([{ role: 'system', content: 'be concise' }]);
 	});
 
 	it('appends to the in-process buffer and returns it via getMessages', async () => {
@@ -121,9 +150,9 @@ describe('EngramChatMessageHistory', () => {
 
 		await history.addMessages([new HumanMessage('q'), new AIMessage('a')]);
 
-		expect((global.fetch as any).mock.calls).toHaveLength(1);
+		expect(fetchMock.mock.calls).toHaveLength(1);
 		const body = parseBody(lastFetchCall().init);
-		expect(body.input.conversation.messages).toEqual([
+		expect(body.input?.conversation?.messages).toEqual([
 			{ role: 'user', content: 'q' },
 			{ role: 'assistant', content: 'a' },
 		]);
@@ -132,16 +161,16 @@ describe('EngramChatMessageHistory', () => {
 	it('clear() empties the local buffer without calling Engram', async () => {
 		const history = new EngramChatMessageHistory(config);
 		await history.addMessage(new HumanMessage('hi'));
-		(global.fetch as any).mockClear();
+		fetchMock.mockClear();
 
 		await history.clear();
 
 		expect((await history.getMessages()).length).toBe(0);
-		expect(global.fetch as any).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it('throws a descriptive error when Engram returns a non-2xx status', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
+		fetchMock.mockResolvedValueOnce(
 			new Response('forbidden', { status: 403, statusText: 'Forbidden' }),
 		);
 		const history = new EngramChatMessageHistory(config);
@@ -160,7 +189,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 	};
 
 	it('POSTs the current input as the search query and returns Engram memories as system messages', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
+		fetchMock.mockResolvedValueOnce(
 			jsonResponse({
 				memories: [
 					{ content: 'User prefers dark mode' },
@@ -189,7 +218,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 	});
 
 	it('forwards group when configured', async () => {
-		(global.fetch as any).mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
 
 		const memory = new EngramMemory({
 			config: { ...config, groupId: 'support-chat' },
@@ -203,7 +232,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 	});
 
 	it('falls back to an empty history when the search request fails', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
+		fetchMock.mockResolvedValueOnce(
 			new Response('boom', { status: 500, statusText: 'Server Error' }),
 		);
 
@@ -218,12 +247,12 @@ describe('EngramMemory.loadMemoryVariables', () => {
 
 		const variables = await memory.loadMemoryVariables({});
 
-		expect(global.fetch as any).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
 		expect(variables.chat_history).toEqual([]);
 	});
 
 	it('uses currentInput captured at supplyData time when values is empty (n8n AI Agent path)', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
+		fetchMock.mockResolvedValueOnce(
 			jsonResponse({ memories: [{ content: 'Alice likes pasta' }], total: 1 }),
 		);
 
@@ -245,8 +274,8 @@ describe('EngramMemory.loadMemoryVariables', () => {
 			new AIMessage('first answer'),
 			new HumanMessage('second question'),
 		]);
-		(global.fetch as any).mockClear();
-		(global.fetch as any).mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		fetchMock.mockClear();
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
 
 		await memory.loadMemoryVariables({});
 
@@ -255,7 +284,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 	});
 
 	it('returns a plain string when returnMessages is false', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
+		fetchMock.mockResolvedValueOnce(
 			jsonResponse({ memories: [{ content: 'remembers your name' }], total: 1 }),
 		);
 
@@ -267,9 +296,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 	});
 
 	it('exposes results under a custom memoryKey', async () => {
-		(global.fetch as any).mockResolvedValueOnce(
-			jsonResponse({ memories: [{ content: 'x' }], total: 1 }),
-		);
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [{ content: 'x' }], total: 1 }));
 
 		const memory = new EngramMemory({ config, memoryKey: 'history', returnMessages: true });
 		const variables = await memory.loadMemoryVariables({ input: 'q' });
@@ -293,9 +320,9 @@ describe('EngramMemory.saveContext', () => {
 
 		await memory.saveContext({ input: 'q' }, { output: 'a' });
 
-		expect((global.fetch as any).mock.calls).toHaveLength(1);
+		expect(fetchMock.mock.calls).toHaveLength(1);
 		const body = parseBody(lastFetchCall().init);
-		expect(body.input.conversation.messages).toEqual([
+		expect(body.input?.conversation?.messages).toEqual([
 			{ role: 'user', content: 'q' },
 			{ role: 'assistant', content: 'a' },
 		]);
@@ -307,7 +334,7 @@ describe('EngramMemory.saveContext', () => {
 		await memory.saveContext({ input: 'q' }, { output: '' });
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.input.conversation.messages).toEqual([{ role: 'user', content: 'q' }]);
+		expect(body.input?.conversation?.messages).toEqual([{ role: 'user', content: 'q' }]);
 	});
 
 	it('does not call Engram when both sides are empty', async () => {
@@ -315,7 +342,7 @@ describe('EngramMemory.saveContext', () => {
 
 		await memory.saveContext({ input: '' }, { output: '' });
 
-		expect(global.fetch as any).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
 
@@ -355,19 +382,15 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		// per-node scoping suffix added). This keeps the assertions about
 		// `user_id` predictable in tests; the fromInput/scoped path is exercised
 		// indirectly by integration of n8n's session helpers.
-		ctx.getNodeParameter.mockImplementation(((
-			param: string,
-			_i: number,
-			defaultValue?: unknown,
-		) => {
+		ctx.getNodeParameter.mockImplementation((param) => {
 			if (param === 'sessionIdType') return 'customKey';
 			if (param === 'sessionKey') return overrides.sessionId ?? USER_ID;
 			if (param === 'groupId') return overrides.groupId ?? '';
 			if (param === 'options') return overrides.options ?? {};
-			return defaultValue;
-		}) as any);
-		ctx.addInputData.mockReturnValue({ index: 0 } as any);
-		ctx.addOutputData.mockReturnValue(undefined as any);
+			return undefined;
+		});
+		ctx.addInputData.mockReturnValue({ index: 0 });
+		ctx.addOutputData.mockReturnValue(undefined);
 		ctx.evaluateExpression.mockReturnValue(undefined);
 		return ctx;
 	}
@@ -381,12 +404,12 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		expect(response).toBeDefined();
 
 		// Drive the returned memory and confirm it talks to Engram with the resolved user_id.
-		(global.fetch as any).mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
 		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
 		expect(body.user_id).toBe('session-42');
-		expect(body.input.conversation.messages).toEqual([{ role: 'user', content: 'hi' }]);
+		expect(body.input?.conversation?.messages).toEqual([{ role: 'user', content: 'hi' }]);
 	});
 
 	it('forwards Group ID and Options into the EngramMemory', async () => {
@@ -402,7 +425,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 
 		expect(memory.memoryKey).toBe('history');
 
-		(global.fetch as any).mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
 		await memory.loadMemoryVariables({ input: 'q' });
 
 		const body = parseBody(lastFetchCall().init);

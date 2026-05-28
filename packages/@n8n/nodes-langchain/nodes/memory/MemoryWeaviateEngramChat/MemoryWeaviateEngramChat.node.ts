@@ -3,6 +3,7 @@ import { BaseListChatMessageHistory } from '@langchain/core/chat_history';
 import type { InputValues, MemoryVariables, OutputValues } from '@langchain/core/memory';
 import type { BaseMessage } from '@langchain/core/messages';
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { logWrapper, getConnectionHintNoticeField } from '@n8n/ai-utilities';
 import {
 	NodeConnectionTypes,
 	NodeOperationError,
@@ -13,7 +14,6 @@ import {
 } from 'n8n-workflow';
 
 import { getSessionId } from '@utils/helpers';
-import { logWrapper, getConnectionHintNoticeField } from '@n8n/ai-utilities';
 
 import {
 	expressionSessionKeyProperty,
@@ -140,10 +140,9 @@ function logFetchFailure(
 		causeMessage: cause?.message,
 		...extra,
 	};
-	// eslint-disable-next-line no-console
+
 	console.warn(`[WeaviateEngram] ${scope} failed:`, JSON.stringify(details));
 	if (e.stack) {
-		// eslint-disable-next-line no-console
 		console.warn(`[WeaviateEngram] ${scope} stack:`, e.stack.split('\n').slice(0, 6).join('\n'));
 	}
 }
@@ -158,7 +157,7 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 	}
 
 	async getMessages(): Promise<BaseMessage[]> {
-		return this.buffer;
+		return await Promise.resolve(this.buffer);
 	}
 
 	async addMessage(message: BaseMessage): Promise<void> {
@@ -168,7 +167,7 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 
 	override async addMessages(messages: BaseMessage[]): Promise<void> {
 		if (messages.length === 0) return;
-		this.buffer.push(...messages);
+		this.buffer.push.apply(this.buffer, messages);
 		await this.postMemories(messages);
 	}
 
@@ -205,6 +204,7 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 
 	async clear(): Promise<void> {
 		this.buffer = [];
+		return await Promise.resolve();
 	}
 }
 
@@ -266,8 +266,8 @@ export class EngramMemory extends BaseChatMemory {
 		const inputKey = this.inputKey ?? 'input';
 		const outputKey = this.outputKey ?? 'output';
 		const messages: BaseMessage[] = [];
-		const input = inputValues[inputKey];
-		const output = outputValues[outputKey];
+		const input: unknown = inputValues[inputKey];
+		const output: unknown = outputValues[outputKey];
 		if (typeof input === 'string' && input.length > 0) messages.push(new HumanMessage(input));
 		if (typeof output === 'string' && output.length > 0) messages.push(new AIMessage(output));
 		if (messages.length > 0) {
