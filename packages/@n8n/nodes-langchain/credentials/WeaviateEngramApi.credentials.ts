@@ -44,15 +44,8 @@ export class WeaviateEngramApi implements ICredentialType {
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL: '={{$credentials.baseUrl}}',
-			url: '/v1/memories/search',
-			method: 'POST',
-			body: {
-				query: 'connection test',
-				retrieval_config: {
-					retrieval_type: 'hybrid',
-					limit: 1,
-				},
-			},
+			url: '/v1/auth/verify',
+			method: 'GET',
 		},
 	};
 }
