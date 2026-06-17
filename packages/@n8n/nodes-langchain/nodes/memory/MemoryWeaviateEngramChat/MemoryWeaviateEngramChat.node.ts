@@ -25,13 +25,28 @@ import {
 interface EngramConfig {
 	apiKey: string;
 	baseUrl: string;
-	userId: string;
+	// Global, stable identity for the person these memories belong to. Sent to
+	// Engram as the `user_id` scope when set. Left `undefined` for project-scoped
+	// Engram projects that don't scope by user. Configured explicitly on the node,
+	// not derived from the n8n session.
+	userId?: string;
+	// The n8n session id, sent to Engram as the `conversation_id` scope property
+	// (under `properties`). Tags every stored memory with its originating session
+	// and, when `limitSearchToConversation` is set, narrows retrieval to it.
+	// Left `undefined` when the user disables conversation scoping (e.g. their
+	// Engram project isn't configured with the `conversation_id` scope property),
+	// in which case it is never sent on adds or searches.
+	conversationId?: string;
 	groupId?: string;
 	searchLimit: number;
 	retrievalType: 'vector' | 'bm25' | 'hybrid';
 	storeProperties?: Record<string, string>;
 	searchProperties?: Record<string, string>;
 	searchTopics?: string[];
+	// When true, retrieval is additionally filtered by `conversation_id` so the
+	// agent only recalls memories from the current session. Off by default to
+	// give cross-conversation, user-level long-term recall.
+	limitSearchToConversation?: boolean;
 	root?: string;
 	waitForCompletion?: boolean;
 	// Default 30000ms matches the Engram Python SDK (httpx timeout=30.0). Node's
@@ -286,11 +301,21 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 					})),
 				},
 			},
-			user_id: this.config.userId,
 		};
+		// Only scope by user when a User ID is configured. Project-scoped Engram
+		// projects don't require (or accept) a user_id.
+		if (this.config.userId) payload.user_id = this.config.userId;
 		if (this.config.groupId) payload.group = this.config.groupId;
-		if (this.config.storeProperties && Object.keys(this.config.storeProperties).length > 0) {
-			payload.properties = this.config.storeProperties;
+		// Tag the stored memory with its originating session as Engram's
+		// `conversation_id` scope property (merged with any user-defined tags),
+		// unless conversation scoping is disabled — then conversationId is
+		// undefined and we send only the user-defined tags, if any.
+		const properties: Record<string, string> = { ...(this.config.storeProperties ?? {}) };
+		if (this.config.conversationId) {
+			properties.conversation_id = this.config.conversationId;
+		}
+		if (Object.keys(properties).length > 0) {
+			payload.properties = properties;
 		}
 		if (this.config.root) payload.root = this.config.root;
 		try {
@@ -329,6 +354,7 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 				error,
 				{
 					userIdLength: this.config.userId?.length,
+					conversationId: this.config.conversationId,
 					group: this.config.groupId,
 					root: this.config.root,
 					storeProperties: this.config.storeProperties,
@@ -421,14 +447,22 @@ export class EngramMemory extends BaseChatMemory {
 				retrieval_type: this.config.retrievalType,
 				limit: this.config.searchLimit,
 			},
-			user_id: this.config.userId,
 		};
+		// Only scope by user when a User ID is configured (see postMemories).
+		if (this.config.userId) payload.user_id = this.config.userId;
 		if (this.config.groupId) payload.group = this.config.groupId;
 		if (this.config.searchTopics && this.config.searchTopics.length > 0) {
 			payload.topics = this.config.searchTopics;
 		}
-		if (this.config.searchProperties && Object.keys(this.config.searchProperties).length > 0) {
-			payload.properties = this.config.searchProperties;
+		// Default retrieval is user-level (cross-conversation). Only narrow it to
+		// the current session when the user opts in, so the agent recalls memories
+		// from every past conversation by default.
+		const searchProperties: Record<string, string> = { ...(this.config.searchProperties ?? {}) };
+		if (this.config.limitSearchToConversation && this.config.conversationId) {
+			searchProperties.conversation_id = this.config.conversationId;
+		}
+		if (Object.keys(searchProperties).length > 0) {
+			payload.properties = searchProperties;
 		}
 
 		try {
@@ -462,6 +496,8 @@ export class EngramMemory extends BaseChatMemory {
 				error,
 				{
 					userIdLength: this.config.userId?.length,
+					conversationId: this.config.conversationId,
+					limitSearchToConversation: this.config.limitSearchToConversation,
 					group: this.config.groupId,
 					retrievalType: this.config.retrievalType,
 					searchTopics: this.config.searchTopics,
@@ -512,7 +548,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			resources: {
 				primaryDocumentation: [
 					{
-						url: 'https://docs.engram.weaviate.io/',
+						url: 'https://docs.weaviate.io/engram',
 					},
 				],
 			},
@@ -530,7 +566,23 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			getConnectionHintNoticeField([NodeConnectionTypes.AiAgent]),
 			{
 				displayName:
-					'The session ID is sent to Engram as the <code>user_id</code>. Engram retrieves long-term memories scoped to this value and stores new turns under it.',
+					'Match the scope to your Engram project: leave <b>User ID</b> empty for a project-scoped project; set <b>User ID</b> for a user-scoped project; additionally enable <b>Send Session as Conversation ID</b> for a conversation-scoped project. <a href="https://docs.weaviate.io/engram" target="_blank">Learn more</a>.',
+				name: 'scopingNotice',
+				type: 'notice',
+				default: '',
+			},
+			{
+				displayName: 'User ID',
+				name: 'userId',
+				type: 'string',
+				default: '',
+				placeholder: 'e.g. alice@example.com',
+				description:
+					"The global, stable identifier for the person these memories belong to, sent to Engram as the <code>user_id</code> scope. Set a static value or an expression (e.g. an authenticated user from a previous node). Leave empty for project-scoped Engram projects that don't scope by user.",
+			},
+			{
+				displayName:
+					'Enable "Send Session as Conversation ID" below to send the Session ID to Engram as the <code>conversation_id</code> scope property. It is off by default since not every Engram project has that scope configured.',
 				name: 'sessionIdNotice',
 				type: 'notice',
 				default: '',
@@ -539,6 +591,14 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			expressionSessionKeyProperty(1),
 			scopedSessionHint(1),
 			sessionKeyProperty,
+			{
+				displayName: 'Send Session as Conversation ID',
+				name: 'sendConversationId',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to send the Session ID to Engram as the <code>conversation_id</code> scope property. Off by default — only enable it if your Engram project is configured with a <code>conversation_id</code> scope property, otherwise requests may be rejected.',
+			},
 			{
 				displayName: 'Group',
 				name: 'groupId',
@@ -575,6 +635,14 @@ export class MemoryWeaviateEngramChat implements INodeType {
 						type: 'number',
 						default: 10,
 						description: 'Maximum number of long-term memories to retrieve from Engram each turn',
+					},
+					{
+						displayName: 'Limit Search to Current Conversation',
+						name: 'limitSearchToConversation',
+						type: 'boolean',
+						default: false,
+						description:
+							'Whether to restrict retrieval to the current session (filters by <code>conversation_id</code>). Has no effect unless "Send Session as Conversation ID" is on. Leave off to recall memories across all of the user\'s past conversations.',
 					},
 					{
 						displayName: 'Request Timeout (Ms)',
@@ -716,12 +784,28 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			baseUrl: string;
 		}>('weaviateEngramApi');
 
-		const sessionId = getSessionId(this, itemIndex);
-		if (!sessionId) {
-			throw new NodeOperationError(
-				this.getNode(),
-				'A session ID is required to scope Engram memories',
-			);
+		// User ID is optional: Engram projects can be project-scoped (no user_id),
+		// user-scoped (user_id), or conversation-scoped (user_id + conversation_id).
+		const userId = (this.getNodeParameter('userId', itemIndex, '') as string).trim();
+
+		const sendConversationId = this.getNodeParameter(
+			'sendConversationId',
+			itemIndex,
+			false,
+		) as boolean;
+
+		// The session is only used as conversation_id, so resolve (and require) it
+		// only when conversation scoping is enabled.
+		let conversationId: string | undefined;
+		if (sendConversationId) {
+			const sessionId = getSessionId(this, itemIndex);
+			if (!sessionId) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'A session ID is required to scope Engram memories by conversation',
+				);
+			}
+			conversationId = sessionId;
 		}
 
 		const groupId = (this.getNodeParameter('groupId', itemIndex, '') as string).trim();
@@ -731,6 +815,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			| 'bm25';
 		const options = this.getNodeParameter('options', itemIndex, {}) as {
 			searchLimit?: number;
+			limitSearchToConversation?: boolean;
 			timeoutMs?: number;
 			searchTopics?: string[];
 			searchProperties?: { property?: Array<{ key?: string; value?: string }> };
@@ -774,9 +859,11 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			config: {
 				apiKey: credentials.apiKey,
 				baseUrl,
-				userId: sessionId,
+				userId: userId || undefined,
+				conversationId,
 				groupId: groupId || undefined,
 				searchLimit: options.searchLimit ?? 10,
+				limitSearchToConversation: options.limitSearchToConversation ?? false,
 				retrievalType,
 				storeProperties: fixedCollectionToMap(options.storeProperties),
 				searchProperties: fixedCollectionToMap(options.searchProperties),

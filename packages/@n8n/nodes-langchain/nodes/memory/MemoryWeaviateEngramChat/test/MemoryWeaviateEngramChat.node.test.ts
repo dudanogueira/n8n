@@ -12,6 +12,7 @@ import {
 const BASE_URL = 'https://api.engram.weaviate.io';
 const API_KEY = 'test-api-key';
 const USER_ID = 'alice@example.com';
+const CONVERSATION_ID = 'conv-xyz';
 
 interface CapturedBody {
 	user_id?: string;
@@ -84,6 +85,7 @@ describe('EngramChatMessageHistory', () => {
 		apiKey: API_KEY,
 		baseUrl: BASE_URL,
 		userId: USER_ID,
+		conversationId: CONVERSATION_ID,
 		searchLimit: 10,
 		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
@@ -105,6 +107,8 @@ describe('EngramChatMessageHistory', () => {
 			conversation: { messages: [{ role: 'user', content: 'hello there' }] },
 		});
 		expect(body.group).toBeUndefined();
+		// The session is always tagged onto stored memories as conversation_id.
+		expect(body.properties).toEqual({ conversation_id: CONVERSATION_ID });
 	});
 
 	it('maps AIMessage to role=assistant', async () => {
@@ -241,7 +245,11 @@ describe('EngramChatMessageHistory', () => {
 		await history.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.properties).toEqual({ env: 'prod', channel: 'slack' });
+		expect(body.properties).toEqual({
+			env: 'prod',
+			channel: 'slack',
+			conversation_id: CONVERSATION_ID,
+		});
 	});
 
 	it('sends root when configured', async () => {
@@ -256,14 +264,45 @@ describe('EngramChatMessageHistory', () => {
 		expect(body.root).toBe('custom-pipeline');
 	});
 
-	it('omits properties and root by default', async () => {
+	it('sends only conversation_id in properties and omits root by default', async () => {
 		const history = new EngramChatMessageHistory(config);
 
 		await history.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.properties).toBeUndefined();
+		expect(body.properties).toEqual({ conversation_id: CONVERSATION_ID });
 		expect(body.root).toBeUndefined();
+	});
+
+	it('omits user_id when no User ID is configured (project-scoped)', async () => {
+		const history = new EngramChatMessageHistory({ ...config, userId: undefined });
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.user_id).toBeUndefined();
+	});
+
+	it('omits conversation_id (and properties entirely) when conversation scoping is disabled', async () => {
+		const history = new EngramChatMessageHistory({ ...config, conversationId: undefined });
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+	});
+
+	it('sends user-defined tags without conversation_id when conversation scoping is disabled', async () => {
+		const history = new EngramChatMessageHistory({
+			...config,
+			conversationId: undefined,
+			storeProperties: { env: 'prod' },
+		});
+
+		await history.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ env: 'prod' });
 	});
 
 	it('polls /v1/runs/{run_id} when waitForCompletion is true', async () => {
@@ -288,6 +327,7 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		apiKey: API_KEY,
 		baseUrl: BASE_URL,
 		userId: USER_ID,
+		conversationId: CONVERSATION_ID,
 		searchLimit: 5,
 		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
@@ -542,6 +582,72 @@ describe('EngramMemory.loadMemoryVariables', () => {
 		expect(body.topics).toBeUndefined();
 		expect(body.properties).toBeUndefined();
 	});
+
+	it('omits user_id on search when no User ID is configured (project-scoped)', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: { ...config, userId: undefined },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.user_id).toBeUndefined();
+	});
+
+	it('does not filter search by conversation_id by default (cross-conversation recall)', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({ config, returnMessages: true });
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+	});
+
+	it('filters search by conversation_id when limitSearchToConversation is true', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: { ...config, limitSearchToConversation: true },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ conversation_id: CONVERSATION_ID });
+	});
+
+	it('does not filter by conversation_id when scoping is disabled even if limitSearchToConversation is true', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: { ...config, conversationId: undefined, limitSearchToConversation: true },
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+	});
+
+	it('merges conversation_id with searchProperties when limitSearchToConversation is true', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+
+		const memory = new EngramMemory({
+			config: {
+				...config,
+				limitSearchToConversation: true,
+				searchProperties: { tenant: 'acme' },
+			},
+			returnMessages: true,
+		});
+		await memory.loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ tenant: 'acme', conversation_id: CONVERSATION_ID });
+	});
 });
 
 describe('EngramMemory.saveContext', () => {
@@ -549,6 +655,7 @@ describe('EngramMemory.saveContext', () => {
 		apiKey: API_KEY,
 		baseUrl: BASE_URL,
 		userId: USER_ID,
+		conversationId: CONVERSATION_ID,
 		searchLimit: 10,
 		retrievalType: 'hybrid' as const,
 		timeoutMs: 30000,
@@ -600,7 +707,9 @@ describe('MemoryWeaviateEngramChat node description', () => {
 describe('MemoryWeaviateEngramChat.supplyData', () => {
 	function createCtx(
 		overrides: {
+			userId?: string;
 			sessionId?: string;
+			sendConversationId?: boolean;
 			groupId?: string;
 			retrievalType?: 'hybrid' | 'vector' | 'bm25';
 			options?: Record<string, unknown>;
@@ -623,8 +732,10 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		// `user_id` predictable in tests; the fromInput/scoped path is exercised
 		// indirectly by integration of n8n's session helpers.
 		ctx.getNodeParameter.mockImplementation((param) => {
+			if (param === 'userId') return overrides.userId ?? USER_ID;
 			if (param === 'sessionIdType') return 'customKey';
-			if (param === 'sessionKey') return overrides.sessionId ?? USER_ID;
+			if (param === 'sessionKey') return overrides.sessionId ?? CONVERSATION_ID;
+			if (param === 'sendConversationId') return overrides.sendConversationId ?? false;
 			if (param === 'groupId') return overrides.groupId ?? '';
 			if (param === 'retrievalType') return overrides.retrievalType ?? 'hybrid';
 			if (param === 'options') return overrides.options ?? {};
@@ -636,20 +747,26 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		return ctx;
 	}
 
-	it('resolves the session ID and returns a working EngramMemory instance', async () => {
+	it('sends the User ID as user_id and the session as conversation_id', async () => {
 		const node = new MemoryWeaviateEngramChat();
-		const ctx = createCtx({ sessionId: 'session-42' });
+		const ctx = createCtx({
+			userId: 'alice@example.com',
+			sessionId: 'session-42',
+			sendConversationId: true,
+		});
 
 		const { response } = await node.supplyData.call(ctx, 0);
 
 		expect(response).toBeDefined();
 
-		// Drive the returned memory and confirm it talks to Engram with the resolved user_id.
+		// Drive the returned memory and confirm it talks to Engram with the
+		// configured user_id and the session tagged as conversation_id.
 		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
 		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.user_id).toBe('session-42');
+		expect(body.user_id).toBe('alice@example.com');
+		expect(body.properties).toEqual({ conversation_id: 'session-42' });
 		expect(body.input?.conversation?.messages).toEqual([{ role: 'user', content: 'hi' }]);
 	});
 
@@ -687,9 +804,29 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		expect(lastFetchCall().url).toBe(`${BASE_URL}/v1/memories`);
 	});
 
-	it('throws when no session ID can be resolved', async () => {
+	it('omits user_id (project-scoped) when User ID is empty', async () => {
 		const node = new MemoryWeaviateEngramChat();
-		const ctx = createCtx({ sessionId: '' });
+		const ctx = createCtx({ userId: '' });
+
+		const { response } = await node.supplyData.call(ctx, 0);
+		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.user_id).toBeUndefined();
+	});
+
+	it('does not require a session when conversation scoping is off', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({ sessionId: '', sendConversationId: false });
+
+		// No throw even though the session ID is empty.
+		const { response } = await node.supplyData.call(ctx, 0);
+		expect(response).toBeDefined();
+	});
+
+	it('throws when conversation scoping is on but no session ID can be resolved', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({ sessionId: '', sendConversationId: true });
 
 		await expect(node.supplyData.call(ctx, 0)).rejects.toThrow(/Key parameter is empty/);
 	});
@@ -711,6 +848,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		const node = new MemoryWeaviateEngramChat();
 		const ctx = createCtx({
 			sessionId: 's1',
+			sendConversationId: true,
 			options: {
 				storeProperties: {
 					property: [
@@ -725,7 +863,7 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.properties).toEqual({ env: 'prod', channel: 'slack' });
+		expect(body.properties).toEqual({ env: 'prod', channel: 'slack', conversation_id: 's1' });
 	});
 
 	it('converts fixedCollection searchProperties to a flat map', async () => {
@@ -748,6 +886,45 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		expect(body.properties).toEqual({ tenant: 'acme' });
 	});
 
+	it('does not send conversation_id on writes by default', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({ sessionId: 's1' });
+
+		const { response } = await node.supplyData.call(ctx, 0);
+		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+	});
+
+	it('skips conversation_id on writes when sendConversationId is false', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({ sessionId: 's1', sendConversationId: false });
+
+		const { response } = await node.supplyData.call(ctx, 0);
+		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toBeUndefined();
+	});
+
+	it('forwards limitSearchToConversation so search filters by the session', async () => {
+		const node = new MemoryWeaviateEngramChat();
+		const ctx = createCtx({
+			sessionId: 's1',
+			sendConversationId: true,
+			options: { limitSearchToConversation: true },
+		});
+
+		const { response } = await node.supplyData.call(ctx, 0);
+
+		fetchMock.mockResolvedValueOnce(jsonResponse({ memories: [], total: 0 }));
+		await (response as EngramMemory).loadMemoryVariables({ input: 'q' });
+
+		const body = parseBody(lastFetchCall().init);
+		expect(body.properties).toEqual({ conversation_id: 's1' });
+	});
+
 	it('forwards searchTopics from options', async () => {
 		const node = new MemoryWeaviateEngramChat();
 		const ctx = createCtx({
@@ -764,10 +941,11 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		expect(body.topics).toEqual(['support', 'onboarding']);
 	});
 
-	it('drops empty fixedCollection rows', async () => {
+	it('drops empty fixedCollection rows but still tags conversation_id', async () => {
 		const node = new MemoryWeaviateEngramChat();
 		const ctx = createCtx({
 			sessionId: 's1',
+			sendConversationId: true,
 			options: {
 				storeProperties: {
 					property: [{ key: '', value: 'ignored' }],
@@ -779,6 +957,6 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
 
 		const body = parseBody(lastFetchCall().init);
-		expect(body.properties).toBeUndefined();
+		expect(body.properties).toEqual({ conversation_id: 's1' });
 	});
 });
