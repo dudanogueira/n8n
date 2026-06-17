@@ -10,7 +10,7 @@ export class WeaviateEngramApi implements ICredentialType {
 
 	displayName = 'Weaviate Engram Credentials';
 
-	documentationUrl = 'https://docs.engram.weaviate.io/';
+	documentationUrl = 'https://docs.weaviate.io/engram';
 
 	properties: INodeProperties[] = [
 		{
