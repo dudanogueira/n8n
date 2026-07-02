@@ -7,20 +7,13 @@ import { logWrapper, getConnectionHintNoticeField } from '@n8n/ai-utilities';
 import {
 	NodeConnectionTypes,
 	NodeOperationError,
+	type ILoadOptionsFunctions,
+	type INodePropertyOptions,
 	type INodeType,
 	type INodeTypeDescription,
 	type ISupplyDataFunctions,
 	type SupplyData,
 } from 'n8n-workflow';
-
-import { getSessionId } from '@utils/helpers';
-
-import {
-	expressionSessionKeyProperty,
-	sessionIdOption,
-	sessionKeyProperty,
-	scopedSessionHint,
-} from '../descriptions';
 
 interface EngramConfig {
 	apiKey: string;
@@ -30,23 +23,23 @@ interface EngramConfig {
 	// Engram projects that don't scope by user. Configured explicitly on the node,
 	// not derived from the n8n session.
 	userId?: string;
-	// The n8n session id, sent to Engram as the `conversation_id` scope property
-	// (under `properties`). Tags every stored memory with its originating session
-	// and, when `limitSearchToConversation` is set, narrows retrieval to it.
-	// Left `undefined` when the user disables conversation scoping (e.g. their
-	// Engram project isn't configured with the `conversation_id` scope property),
-	// in which case it is never sent on adds or searches.
-	conversationId?: string;
+	// Resolved scope properties (name -> value) as configured in the Engram
+	// project (e.g. `conversation_id`, `session_id`, `thread_id`). Split because
+	// store and search treat them differently:
+	// - storeScopeProperties: ALWAYS sent on store — Engram rejects a store that
+	//   omits a topic's required scope property.
+	// - searchScopeProperties: sent on search only for the properties the user
+	//   wants to filter retrieval by. Omitting one broadens recall across every
+	//   value (e.g. store per conversation_id but still recall cross-conversation).
+	// Values come from static/expression inputs or the resolved n8n session id.
+	storeScopeProperties?: Record<string, string>;
+	searchScopeProperties?: Record<string, string>;
 	groupId?: string;
 	searchLimit: number;
 	retrievalType: 'vector' | 'bm25' | 'hybrid';
 	storeProperties?: Record<string, string>;
 	searchProperties?: Record<string, string>;
 	searchTopics?: string[];
-	// When true, retrieval is additionally filtered by `conversation_id` so the
-	// agent only recalls memories from the current session. Off by default to
-	// give cross-conversation, user-level long-term recall.
-	limitSearchToConversation?: boolean;
 	root?: string;
 	waitForCompletion?: boolean;
 	// Default 30000ms matches the Engram Python SDK (httpx timeout=30.0). Node's
@@ -73,6 +66,133 @@ interface EngramMemoryRecord {
 interface EngramSearchResponse {
 	memories?: EngramMemoryRecord[];
 	total?: number;
+}
+
+// Shape of GET /v1/groups (Engram's GroupList schema). Drives the Group, Search
+// Topics and Scope Properties dropdowns — and the runtime requirement checks —
+// so users configure from what their Engram project actually defines instead of
+// typing free-text that must match exactly.
+interface EngramTopicScoping {
+	// When true, memories in this topic are partitioned by `user_id`, so the
+	// request must carry a User ID.
+	user_scoped?: boolean;
+	// Property names (e.g. `conversation_id`, `session_id`) that must be present
+	// under `properties` on every store/search touching this topic.
+	scope_properties?: string[];
+}
+
+interface EngramTopic {
+	topic_name?: string;
+	description?: string;
+	scoping?: EngramTopicScoping;
+}
+
+interface EngramGroup {
+	group_id?: string;
+	name?: string;
+	topics?: EngramTopic[];
+}
+
+interface EngramGroupList {
+	groups?: EngramGroup[];
+}
+
+// A context that can authenticate an HTTP request against the Engram credential.
+// Both loadOptions (config UI) and supplyData (execution) provide these, so the
+// same fetch helper serves the dropdowns and the runtime requirement checks.
+type EngramRequestContext = ILoadOptionsFunctions | ISupplyDataFunctions;
+
+// Fetch the project's groups (with their topics/scoping). Reuses the
+// credential's Bearer auth via httpRequestWithAuthentication so we don't
+// re-implement auth here, and normalises the base URL the same way supplyData
+// does.
+async function fetchGroups(ctx: EngramRequestContext): Promise<EngramGroup[]> {
+	const credentials = await ctx.getCredentials<{ baseUrl?: string }>('weaviateEngramApi');
+	const baseUrl = (credentials.baseUrl ?? 'https://api.engram.weaviate.io').replace(/\/+$/, '');
+	const response = (await ctx.helpers.httpRequestWithAuthentication.call(ctx, 'weaviateEngramApi', {
+		method: 'GET',
+		url: `${baseUrl}/v1/groups`,
+		json: true,
+	})) as EngramGroupList | undefined;
+	return response?.groups ?? [];
+}
+
+// An empty/unset Group falls back to Engram's built-in "default" group, so
+// requirement discovery and the scope-property dropdown resolve against it too.
+const DEFAULT_GROUP_NAME = 'default';
+
+function resolveGroupName(groupId?: string): string {
+	return groupId && groupId.length > 0 ? groupId : DEFAULT_GROUP_NAME;
+}
+
+// Read the top-level `groupId` from a loadOptions context. The scope-property
+// and topics dropdowns live inside collections, and reading a sibling top-level
+// param from a nested field is only reliable via getNodeParameter (as other
+// nodes with nested loadOptions do). Falls back to getCurrentNodeParameter and
+// then undefined so a read failure never blanks the dropdown.
+function readSelectedGroup(ctx: ILoadOptionsFunctions): string | undefined {
+	try {
+		const value = ctx.getNodeParameter('groupId', 0) as string | undefined;
+		if (value) return value;
+	} catch {
+		// Fall through to getCurrentNodeParameter.
+	}
+	try {
+		return ctx.getCurrentNodeParameter('groupId') as string | undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+interface GroupRequirements {
+	// True when any topic in the group is user-scoped — the request must send a
+	// User ID.
+	requiresUserId: boolean;
+	// Union of every topic's `scope_properties` — each must be present under
+	// `properties`.
+	requiredScopeProperties: string[];
+}
+
+// Derive what a group requires by unioning the scoping across its topics. Store
+// requests can land in any topic (Engram routes by extraction), so the union —
+// not a single topic — is the safe requirement set.
+function deriveGroupRequirements(groups: EngramGroup[], groupName: string): GroupRequirements {
+	const group = groups.find((g) => g.name === groupName);
+	const topics = group?.topics ?? [];
+	const requiredScopeProperties = new Set<string>();
+	let requiresUserId = false;
+	for (const topic of topics) {
+		if (topic.scoping?.user_scoped) requiresUserId = true;
+		for (const property of topic.scoping?.scope_properties ?? []) {
+			if (typeof property === 'string' && property.length > 0) {
+				requiredScopeProperties.add(property);
+			}
+		}
+	}
+	return { requiresUserId, requiredScopeProperties: [...requiredScopeProperties] };
+}
+
+// Resolve the chat session ID the way n8n's memory nodes do for the "Connected
+// Chat Trigger" option: read `$json.sessionId`, falling back to the connected
+// Chat Trigger's output. Unlike the shared getSessionId() we do NOT append the
+// per-node scoping suffix — Engram scope properties (conversation_id, etc.) need
+// the raw session value, not a memory-bucket key.
+function resolveChatSessionId(ctx: ISupplyDataFunctions, itemIndex: number): string | undefined {
+	let sessionId = ctx.evaluateExpression('{{ $json.sessionId }}', itemIndex) as string | undefined;
+	if (!sessionId) {
+		try {
+			const chatTrigger = ctx.getChatTrigger();
+			if (chatTrigger) {
+				sessionId = ctx.evaluateExpression(
+					`{{ $('${chatTrigger.name}').first().json.sessionId }}`,
+					itemIndex,
+				) as string | undefined;
+			}
+		} catch {
+			// No reachable Chat Trigger — leave sessionId undefined.
+		}
+	}
+	return sessionId || undefined;
 }
 
 function messageRole(message: BaseMessage): 'user' | 'assistant' | 'system' {
@@ -306,14 +426,13 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 		// projects don't require (or accept) a user_id.
 		if (this.config.userId) payload.user_id = this.config.userId;
 		if (this.config.groupId) payload.group = this.config.groupId;
-		// Tag the stored memory with its originating session as Engram's
-		// `conversation_id` scope property (merged with any user-defined tags),
-		// unless conversation scoping is disabled — then conversationId is
-		// undefined and we send only the user-defined tags, if any.
-		const properties: Record<string, string> = { ...(this.config.storeProperties ?? {}) };
-		if (this.config.conversationId) {
-			properties.conversation_id = this.config.conversationId;
-		}
+		// Send the group's required scope properties (name -> value as configured
+		// in the Engram project) merged with any user-defined tags. Omit the field
+		// entirely when neither is present.
+		const properties: Record<string, string> = {
+			...(this.config.storeProperties ?? {}),
+			...(this.config.storeScopeProperties ?? {}),
+		};
 		if (Object.keys(properties).length > 0) {
 			payload.properties = properties;
 		}
@@ -354,7 +473,7 @@ export class EngramChatMessageHistory extends BaseListChatMessageHistory {
 				error,
 				{
 					userIdLength: this.config.userId?.length,
-					conversationId: this.config.conversationId,
+					scopeProperties: this.config.storeScopeProperties,
 					group: this.config.groupId,
 					root: this.config.root,
 					storeProperties: this.config.storeProperties,
@@ -454,13 +573,15 @@ export class EngramMemory extends BaseChatMemory {
 		if (this.config.searchTopics && this.config.searchTopics.length > 0) {
 			payload.topics = this.config.searchTopics;
 		}
-		// Default retrieval is user-level (cross-conversation). Only narrow it to
-		// the current session when the user opts in, so the agent recalls memories
-		// from every past conversation by default.
-		const searchProperties: Record<string, string> = { ...(this.config.searchProperties ?? {}) };
-		if (this.config.limitSearchToConversation && this.config.conversationId) {
-			searchProperties.conversation_id = this.config.conversationId;
-		}
+		// Only the scope properties the user opted to filter search by are sent
+		// here — each narrows retrieval to memories matching that value. Ones left
+		// out broaden recall across every value of that property (e.g. store per
+		// conversation_id but recall cross-conversation). Merged with any
+		// user-defined search filters.
+		const searchProperties: Record<string, string> = {
+			...(this.config.searchProperties ?? {}),
+			...(this.config.searchScopeProperties ?? {}),
+		};
 		if (Object.keys(searchProperties).length > 0) {
 			payload.properties = searchProperties;
 		}
@@ -496,8 +617,7 @@ export class EngramMemory extends BaseChatMemory {
 				error,
 				{
 					userIdLength: this.config.userId?.length,
-					conversationId: this.config.conversationId,
-					limitSearchToConversation: this.config.limitSearchToConversation,
+					scopeProperties: this.config.searchScopeProperties,
 					group: this.config.groupId,
 					retrievalType: this.config.retrievalType,
 					searchTopics: this.config.searchTopics,
@@ -566,7 +686,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			getConnectionHintNoticeField([NodeConnectionTypes.AiAgent]),
 			{
 				displayName:
-					'Match the scope to your Engram project: leave <b>User ID</b> empty for a project-scoped project; set <b>User ID</b> for a user-scoped project; additionally enable <b>Send Session as Conversation ID</b> for a conversation-scoped project. <a href="https://docs.weaviate.io/engram" target="_blank">Learn more</a>.',
+					'Set <b>User ID</b> if your Engram project has user-scoped topics. Add a <b>Scope Property</b> row for each scope your project defines (e.g. <code>conversation_id</code>, <code>session_id</code>), mapping it to a value or the n8n session. Requirements are read from your project via the group you select. <a href="https://docs.weaviate.io/engram" target="_blank">Learn more</a>.',
 				name: 'scopingNotice',
 				type: 'notice',
 				default: '',
@@ -578,36 +698,91 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				default: '',
 				placeholder: 'e.g. alice@example.com',
 				description:
-					"The global, stable identifier for the person these memories belong to, sent to Engram as the <code>user_id</code> scope. Set a static value or an expression (e.g. an authenticated user from a previous node). Leave empty for project-scoped Engram projects that don't scope by user.",
+					"The global, stable identifier for the person these memories belong to, sent to Engram as the <code>user_id</code> scope. Required when the selected group has user-scoped topics. Set a static value or an expression (e.g. an authenticated user from a previous node). Takes precedence over a <code>user_id</code> row in Scope Properties. Leave empty for project-scoped Engram projects that don't scope by user.",
 			},
 			{
-				displayName:
-					'Enable "Send Session as Conversation ID" below to send the Session ID to Engram as the <code>conversation_id</code> scope property. It is off by default since not every Engram project has that scope configured.',
-				name: 'sessionIdNotice',
-				type: 'notice',
-				default: '',
-			},
-			sessionIdOption,
-			expressionSessionKeyProperty(1),
-			scopedSessionHint(1),
-			sessionKeyProperty,
-			{
-				displayName: 'Send Session as Conversation ID',
-				name: 'sendConversationId',
-				type: 'boolean',
-				default: false,
-				description:
-					'Whether to send the Session ID to Engram as the <code>conversation_id</code> scope property. Off by default — only enable it if your Engram project is configured with a <code>conversation_id</code> scope property, otherwise requests may be rejected.',
-			},
-			{
-				displayName: 'Group',
+				displayName: 'Group Name or ID',
 				name: 'groupId',
-				type: 'string',
+				type: 'options',
 				default: '',
-				placeholder: 'default',
-				hint: 'The group must already exist in your Engram project. Leave empty to fall back to the "default" group.',
+				typeOptions: {
+					loadOptionsMethod: 'getGroups',
+				},
+				hint: 'Loaded from your Engram project. Leave empty to fall back to the "default" group. Engram does not auto-create groups, so only existing groups are listed.',
 				description:
-					'Optional conversation- or project-level scope (sent as Engram\'s "group" field). When set, both adds and searches are filtered by this group. Engram does not auto-create groups — if you see "group not found" errors, create the group in your Engram project first, or leave this empty to use the built-in "default" group.',
+					'Optional conversation- or project-level scope (sent as Engram\'s "group" field), used to filter both adds and searches. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+			},
+			{
+				displayName: 'Scope Properties',
+				name: 'scopeProperties',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				default: {},
+				placeholder: 'Add Scope Property',
+				description:
+					'Values for the scope values your Engram project requires (read from the selected group), including <code>user_id</code> when the group is user-scoped. Scope properties are sent under <code>properties</code>; <code>user_id</code> is sent as the top-level user scope. Map a value to the n8n session to group memories by conversation.',
+				options: [
+					{
+						name: 'property',
+						displayName: 'Property',
+						values: [
+							{
+								displayName: 'Property Name or ID',
+								name: 'name',
+								type: 'options',
+								default: '',
+								typeOptions: {
+									loadOptionsMethod: 'getScopeProperties',
+									loadOptionsDependsOn: ['groupId'],
+								},
+								description:
+									'Scope property required by the selected group. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+							},
+							{
+								displayName: 'Value Source',
+								name: 'source',
+								type: 'options',
+								options: [
+									{ name: 'Value', value: 'value' },
+									{ name: 'N8n Session ID', value: 'session' },
+								],
+								default: 'value',
+								description:
+									'Where the property value comes from: a static value/expression, or the session ID from a connected Chat Trigger',
+							},
+							{
+								displayName: 'Value',
+								name: 'value',
+								type: 'string',
+								default: '',
+								displayOptions: { show: { source: ['value'] } },
+								description: 'The value to send for this scope property',
+							},
+							{
+								// Cosmetic, disabled field mirroring the standard "Connected
+								// Chat Trigger" session control — it shows the user what will
+								// be sent. The value is resolved at runtime from the Chat
+								// Trigger, not read from this field.
+								displayName: 'Value (From Chat Trigger)',
+								name: 'sessionPreview',
+								type: 'string',
+								default: '={{ $json.sessionId }}',
+								disabledOptions: { show: { source: ['session'] } },
+								displayOptions: { show: { source: ['session'] } },
+								description:
+									"Uses the session ID from a directly connected Chat Trigger (its 'sessionId' output)",
+							},
+							{
+								displayName: 'Filter Search by This Value',
+								name: 'filterSearch',
+								type: 'boolean',
+								default: true,
+								description:
+									'Whether retrieval is narrowed to memories matching this value. The value is always sent when storing; turn this off to still store it but recall across every value of this property (e.g. store per conversation but search across all conversations).',
+							},
+						],
+					},
+				],
 			},
 			{
 				displayName: 'Retrieval Type',
@@ -637,14 +812,6 @@ export class MemoryWeaviateEngramChat implements INodeType {
 						description: 'Maximum number of long-term memories to retrieve from Engram each turn',
 					},
 					{
-						displayName: 'Limit Search to Current Conversation',
-						name: 'limitSearchToConversation',
-						type: 'boolean',
-						default: false,
-						description:
-							'Whether to restrict retrieval to the current session (filters by <code>conversation_id</code>). Has no effect unless "Send Session as Conversation ID" is on. Leave off to recall memories across all of the user\'s past conversations.',
-					},
-					{
 						displayName: 'Request Timeout (Ms)',
 						name: 'timeoutMs',
 						type: 'number',
@@ -653,14 +820,16 @@ export class MemoryWeaviateEngramChat implements INodeType {
 							'Maximum time to wait for an Engram request before aborting. Matches the Engram Python SDK default (30s). Increase if you see UND_ERR_CONNECT_TIMEOUT in the n8n log.',
 					},
 					{
-						displayName: 'Search Topics',
+						displayName: 'Search Topic Names or IDs',
 						name: 'searchTopics',
-						type: 'string',
-						typeOptions: { multipleValues: true },
+						type: 'multiOptions',
+						typeOptions: {
+							loadOptionsMethod: 'getTopics',
+							loadOptionsDependsOn: ['groupId'],
+						},
 						default: [],
-						placeholder: 'Add Topic',
 						description:
-							'Restrict search to these Engram topics. Leave empty to search across all topics.',
+							'Restrict search to these Engram topics. Loaded from the selected group (or all groups when none is selected). Leave empty to search across all topics. Choose from the list, or specify IDs using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 					},
 					{
 						displayName: 'Search Properties Filter',
@@ -778,6 +947,79 @@ export class MemoryWeaviateEngramChat implements INodeType {
 		],
 	};
 
+	methods = {
+		loadOptions: {
+			// Populate the Group dropdown from GET /v1/groups so users pick an
+			// existing group instead of typing a name that must match exactly.
+			async getGroups(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const groups = await fetchGroups(this);
+				return groups
+					.map((group) => group.name)
+					.filter((name): name is string => typeof name === 'string' && name.length > 0)
+					.sort((a, b) => a.localeCompare(b))
+					.map((name) => ({ name, value: name }));
+			},
+			// Populate the Search Topics dropdown from the same groups payload,
+			// scoped to the selected group when one is chosen (otherwise every
+			// group's topics). De-duplicated since topic names can repeat across
+			// groups, and annotated with each topic's description as a tooltip.
+			async getTopics(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const groups = await fetchGroups(this);
+				const selectedGroup = readSelectedGroup(this);
+				const matched =
+					selectedGroup && selectedGroup.length > 0
+						? groups.filter((group) => group.name === selectedGroup)
+						: [];
+				const relevant = matched.length > 0 ? matched : groups;
+
+				const seen = new Set<string>();
+				const options: INodePropertyOptions[] = [];
+				for (const group of relevant) {
+					for (const topic of group.topics ?? []) {
+						const name = topic.topic_name;
+						if (typeof name === 'string' && name.length > 0 && !seen.has(name)) {
+							seen.add(name);
+							options.push({
+								name,
+								value: name,
+								description: topic.description,
+							});
+						}
+					}
+				}
+				return options.sort((a, b) => a.name.localeCompare(b.name));
+			},
+			// Populate the Scope Property dropdown with the scope properties defined
+			// in the Engram project. Scoped to the selected group when one is
+			// chosen and matches; otherwise the union across every group, so the
+			// dropdown is never needlessly empty (e.g. before a group is picked, or
+			// when the sibling group value can't be read from this nested field).
+			async getScopeProperties(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const groups = await fetchGroups(this);
+				const selectedGroup = readSelectedGroup(this);
+				const matched =
+					selectedGroup && selectedGroup.length > 0
+						? groups.filter((group) => group.name === selectedGroup)
+						: [];
+				const relevant = matched.length > 0 ? matched : groups;
+
+				const seen = new Set<string>();
+				for (const group of relevant) {
+					for (const topic of group.topics ?? []) {
+						// `user_id` is a scope value too — when any topic is user-scoped
+						// the request must carry it, so it belongs in this dropdown
+						// alongside the per-topic `scope_properties`.
+						if (topic.scoping?.user_scoped) seen.add('user_id');
+						for (const property of topic.scoping?.scope_properties ?? []) {
+							if (typeof property === 'string' && property.length > 0) seen.add(property);
+						}
+					}
+				}
+				return [...seen].sort((a, b) => a.localeCompare(b)).map((name) => ({ name, value: name }));
+			},
+		},
+	};
+
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
 		const credentials = await this.getCredentials<{
 			apiKey: string;
@@ -785,37 +1027,80 @@ export class MemoryWeaviateEngramChat implements INodeType {
 		}>('weaviateEngramApi');
 
 		// User ID is optional: Engram projects can be project-scoped (no user_id),
-		// user-scoped (user_id), or conversation-scoped (user_id + conversation_id).
-		const userId = (this.getNodeParameter('userId', itemIndex, '') as string).trim();
+		// user-scoped (user_id), or conversation-scoped (user_id + scope
+		// properties like conversation_id / session_id). It can be set via the
+		// dedicated field below or mapped as a `user_id` row in Scope Properties.
+		const dedicatedUserId = (this.getNodeParameter('userId', itemIndex, '') as string).trim();
 
-		const sendConversationId = this.getNodeParameter(
-			'sendConversationId',
-			itemIndex,
-			false,
-		) as boolean;
+		const groupId = (this.getNodeParameter('groupId', itemIndex, '') as string).trim();
 
-		// The session is only used as conversation_id, so resolve (and require) it
-		// only when conversation scoping is enabled.
-		let conversationId: string | undefined;
-		if (sendConversationId) {
-			const sessionId = getSessionId(this, itemIndex);
+		// Resolve the Scope Properties mapper into two name -> value maps. Each row
+		// draws its value from a static value/expression or the resolved n8n
+		// session. Values are ALWAYS sent when storing; on search only the rows
+		// the user opted to filter by are sent, so recall can stay broad for the
+		// others. The session is only resolved (and required) when a row asks for
+		// it, so project-scoped setups need no session at all.
+		const scopeRows =
+			(
+				this.getNodeParameter('scopeProperties', itemIndex, {}) as {
+					property?: Array<{
+						name?: string;
+						source?: 'value' | 'session';
+						value?: string;
+						filterSearch?: boolean;
+					}>;
+				}
+			).property ?? [];
+
+		let sessionId: string | undefined;
+		if (scopeRows.some((row) => row.source === 'session')) {
+			sessionId = resolveChatSessionId(this, itemIndex);
 			if (!sessionId) {
 				throw new NodeOperationError(
 					this.getNode(),
-					'A session ID is required to scope Engram memories by conversation',
+					'No session ID found for a Scope Property mapped to the n8n Session ID',
+					{
+						description:
+							"Expected a 'sessionId' field from a directly connected Chat Trigger. Connect a Chat Trigger, or switch that Scope Property's Value Source to 'Value'.",
+						itemIndex,
+					},
 				);
 			}
-			conversationId = sessionId;
 		}
 
-		const groupId = (this.getNodeParameter('groupId', itemIndex, '') as string).trim();
+		const storeScopeProperties: Record<string, string> = {};
+		const searchScopeProperties: Record<string, string> = {};
+		let mappedUserId: string | undefined;
+		for (const row of scopeRows) {
+			const name = row.name?.trim();
+			if (!name) continue;
+			const value = row.source === 'session' ? sessionId : row.value;
+			if (typeof value !== 'string' || value.length === 0) continue;
+			// `user_id` is a top-level Engram scope, not a `properties` entry — route
+			// it to user_id (always applied to both store and search) rather than
+			// into the scope-property maps.
+			if (name === 'user_id') {
+				mappedUserId = value;
+				continue;
+			}
+			storeScopeProperties[name] = value;
+			// Default to filtering search by the value (filterSearch defaults to
+			// true in the UI); only skip it when the user explicitly turned it off.
+			if (row.filterSearch !== false) {
+				searchScopeProperties[name] = value;
+			}
+		}
+
+		// The dedicated User ID field wins when set; otherwise fall back to a
+		// `user_id` row mapped in Scope Properties.
+		const userId = dedicatedUserId || mappedUserId;
+
 		const retrievalType = this.getNodeParameter('retrievalType', itemIndex, 'hybrid') as
 			| 'hybrid'
 			| 'vector'
 			| 'bm25';
 		const options = this.getNodeParameter('options', itemIndex, {}) as {
 			searchLimit?: number;
-			limitSearchToConversation?: boolean;
 			timeoutMs?: number;
 			searchTopics?: string[];
 			searchProperties?: { property?: Array<{ key?: string; value?: string }> };
@@ -855,15 +1140,57 @@ export class MemoryWeaviateEngramChat implements INodeType {
 			},
 		};
 
+		// Best-effort: read the selected group's scoping from the groups API and
+		// surface unmet requirements before hitting Engram. A user-scoped group
+		// without a User ID is a hard error (unambiguous). Missing scope-property
+		// values are a single warning — store requests can route to any topic, so
+		// hard-failing here risks false positives, and Engram returns the
+		// authoritative rejection anyway. If the groups call itself fails, skip
+		// validation rather than break the run.
+		try {
+			const groups = await fetchGroups(this);
+			const groupName = resolveGroupName(groupId || undefined);
+			const { requiresUserId, requiredScopeProperties } = deriveGroupRequirements(
+				groups,
+				groupName,
+			);
+			if (requiresUserId && !userId) {
+				throw new NodeOperationError(
+					this.getNode(),
+					`The Engram group "${groupName}" has user-scoped topics, so a User ID is required`,
+				);
+			}
+			// Enforcement is about STORE — every required scope property must have a
+			// value to store. Filtering search by them is a separate, optional
+			// choice, so we check against the store map only.
+			const missing = requiredScopeProperties.filter(
+				(property) => !(property in storeScopeProperties),
+			);
+			if (missing.length > 0) {
+				logger.warn(
+					`[WeaviateEngram] Group "${groupName}" requires scope ${
+						missing.length === 1 ? 'property' : 'properties'
+					} "${missing.join('", "')}" but no value was provided. Engram may reject store requests.`,
+					{ scope: 'config', group: groupName, missingScopeProperties: missing },
+				);
+			}
+		} catch (error) {
+			// Our own validation failure — surface it. Anything else is the groups
+			// fetch failing, in which case we skip validation and continue.
+			if (error instanceof NodeOperationError) throw error;
+		}
+
 		const memory = new EngramMemory({
 			config: {
 				apiKey: credentials.apiKey,
 				baseUrl,
 				userId: userId || undefined,
-				conversationId,
+				storeScopeProperties:
+					Object.keys(storeScopeProperties).length > 0 ? storeScopeProperties : undefined,
+				searchScopeProperties:
+					Object.keys(searchScopeProperties).length > 0 ? searchScopeProperties : undefined,
 				groupId: groupId || undefined,
 				searchLimit: options.searchLimit ?? 10,
-				limitSearchToConversation: options.limitSearchToConversation ?? false,
 				retrievalType,
 				storeProperties: fixedCollectionToMap(options.storeProperties),
 				searchProperties: fixedCollectionToMap(options.searchProperties),

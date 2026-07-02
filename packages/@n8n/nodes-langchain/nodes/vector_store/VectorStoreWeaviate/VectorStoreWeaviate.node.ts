@@ -62,6 +62,9 @@ class ExtendedWeaviateVectorStore extends WeaviateStore {
 		const args = this.args;
 
 		if (args.hybridQuery) {
+			// Typed as a literal array so it satisfies weaviate-client's
+			// `MetadataKeys` union instead of widening to `string[]`.
+			const explainScoreMetadata: Array<'explainScore'> = ['explainScore'];
 			const options = {
 				limit: k ?? undefined,
 				autoLimit: args.autoCutLimit ?? undefined,
@@ -73,7 +76,7 @@ class ExtendedWeaviateVectorStore extends WeaviateStore {
 					: undefined,
 				maxVectorDistance: args.maxVectorDistance ?? undefined,
 				fusionType: args.fusionType,
-				returnMetadata: args.hybridExplainScore ? ['explainScore'] : undefined,
+				returnMetadata: args.hybridExplainScore ? explainScoreMetadata : undefined,
 			};
 			const content = await super.hybridSearch(args.hybridQuery, options);
 			return content.map((doc) => {
