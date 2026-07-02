@@ -698,7 +698,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				default: '',
 				placeholder: 'e.g. alice@example.com',
 				description:
-					"The global, stable identifier for the person these memories belong to, sent to Engram as the <code>user_id</code> scope. Required when the selected group has user-scoped topics. Set a static value or an expression (e.g. an authenticated user from a previous node). Takes precedence over a <code>user_id</code> row in Scope Properties. Leave empty for project-scoped Engram projects that don't scope by user.",
+					"The global, stable identifier for the person these memories belong to, sent to Engram as the <code>user_id</code> scope. Required when the selected group has user-scoped topics. Set a static value or an expression (e.g. an authenticated user from a previous node). Leave empty for project-scoped Engram projects that don't scope by user.",
 			},
 			{
 				displayName: 'Group Name or ID',
@@ -720,7 +720,7 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				default: {},
 				placeholder: 'Add Scope Property',
 				description:
-					'Values for the scope values your Engram project requires (read from the selected group), including <code>user_id</code> when the group is user-scoped. Scope properties are sent under <code>properties</code>; <code>user_id</code> is sent as the top-level user scope. Map a value to the n8n session to group memories by conversation.',
+					'Values for the scope properties your Engram project requires (read from the selected group). Each is sent under <code>properties</code> on both store and search. Map a property to the n8n session to group memories by conversation.',
 				options: [
 					{
 						name: 'property',
@@ -1006,10 +1006,6 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				const seen = new Set<string>();
 				for (const group of relevant) {
 					for (const topic of group.topics ?? []) {
-						// `user_id` is a scope value too — when any topic is user-scoped
-						// the request must carry it, so it belongs in this dropdown
-						// alongside the per-topic `scope_properties`.
-						if (topic.scoping?.user_scoped) seen.add('user_id');
 						for (const property of topic.scoping?.scope_properties ?? []) {
 							if (typeof property === 'string' && property.length > 0) seen.add(property);
 						}
@@ -1028,9 +1024,8 @@ export class MemoryWeaviateEngramChat implements INodeType {
 
 		// User ID is optional: Engram projects can be project-scoped (no user_id),
 		// user-scoped (user_id), or conversation-scoped (user_id + scope
-		// properties like conversation_id / session_id). It can be set via the
-		// dedicated field below or mapped as a `user_id` row in Scope Properties.
-		const dedicatedUserId = (this.getNodeParameter('userId', itemIndex, '') as string).trim();
+		// properties like conversation_id / session_id).
+		const userId = (this.getNodeParameter('userId', itemIndex, '') as string).trim();
 
 		const groupId = (this.getNodeParameter('groupId', itemIndex, '') as string).trim();
 
@@ -1070,19 +1065,11 @@ export class MemoryWeaviateEngramChat implements INodeType {
 
 		const storeScopeProperties: Record<string, string> = {};
 		const searchScopeProperties: Record<string, string> = {};
-		let mappedUserId: string | undefined;
 		for (const row of scopeRows) {
 			const name = row.name?.trim();
 			if (!name) continue;
 			const value = row.source === 'session' ? sessionId : row.value;
 			if (typeof value !== 'string' || value.length === 0) continue;
-			// `user_id` is a top-level Engram scope, not a `properties` entry — route
-			// it to user_id (always applied to both store and search) rather than
-			// into the scope-property maps.
-			if (name === 'user_id') {
-				mappedUserId = value;
-				continue;
-			}
 			storeScopeProperties[name] = value;
 			// Default to filtering search by the value (filterSearch defaults to
 			// true in the UI); only skip it when the user explicitly turned it off.
@@ -1090,10 +1077,6 @@ export class MemoryWeaviateEngramChat implements INodeType {
 				searchScopeProperties[name] = value;
 			}
 		}
-
-		// The dedicated User ID field wins when set; otherwise fall back to a
-		// `user_id` row mapped in Scope Properties.
-		const userId = dedicatedUserId || mappedUserId;
 
 		const retrievalType = this.getNodeParameter('retrievalType', itemIndex, 'hybrid') as
 			| 'hybrid'

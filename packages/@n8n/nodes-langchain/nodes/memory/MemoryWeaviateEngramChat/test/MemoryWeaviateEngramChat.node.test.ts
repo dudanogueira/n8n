@@ -813,32 +813,14 @@ describe('MemoryWeaviateEngramChat.methods.loadOptions', () => {
 		expect(options.map((o) => o.value)).toEqual(['TicketContext', 'UserProfile']);
 	});
 
-	it('getScopeProperties lists scope properties plus user_id for a user-scoped group', async () => {
+	it('getScopeProperties lists the required scope properties for the selected group', async () => {
 		const node = new MemoryWeaviateEngramChat();
 		const { ctx } = createLoadOptionsCtx('support');
 
 		const options = await node.methods.loadOptions.getScopeProperties.call(ctx);
 
-		// Union across the support group's topics, including user_id (topics are
-		// user-scoped), sorted.
-		expect(options.map((o) => o.value)).toEqual(['session_id', 'ticket_id', 'user_id']);
-	});
-
-	it('getScopeProperties omits user_id when no topic is user-scoped', async () => {
-		const node = new MemoryWeaviateEngramChat();
-		const { ctx, httpMock } = createLoadOptionsCtx('support');
-		httpMock.mockResolvedValue({
-			groups: [
-				{
-					name: 'support',
-					topics: [{ topic_name: 'TicketContext', scoping: { scope_properties: ['ticket_id'] } }],
-				},
-			],
-		});
-
-		const options = await node.methods.loadOptions.getScopeProperties.call(ctx);
-
-		expect(options.map((o) => o.value)).toEqual(['ticket_id']);
+		// Union across the support group's topics, sorted.
+		expect(options.map((o) => o.value)).toEqual(['session_id', 'ticket_id']);
 	});
 
 	it('getScopeProperties lists the union across all groups when none is selected', async () => {
@@ -849,12 +831,7 @@ describe('MemoryWeaviateEngramChat.methods.loadOptions', () => {
 
 		// Union across every group, de-duplicated and sorted — never empty just
 		// because no group is picked yet.
-		expect(options.map((o) => o.value)).toEqual([
-			'conversation_id',
-			'session_id',
-			'ticket_id',
-			'user_id',
-		]);
+		expect(options.map((o) => o.value)).toEqual(['conversation_id', 'session_id', 'ticket_id']);
 	});
 
 	it('getScopeProperties falls back to the union when the selected group has no match', async () => {
@@ -863,12 +840,7 @@ describe('MemoryWeaviateEngramChat.methods.loadOptions', () => {
 
 		const options = await node.methods.loadOptions.getScopeProperties.call(ctx);
 
-		expect(options.map((o) => o.value)).toEqual([
-			'conversation_id',
-			'session_id',
-			'ticket_id',
-			'user_id',
-		]);
+		expect(options.map((o) => o.value)).toEqual(['conversation_id', 'session_id', 'ticket_id']);
 	});
 
 	it('getScopeProperties still resolves when the sibling group value cannot be read', async () => {
@@ -880,12 +852,7 @@ describe('MemoryWeaviateEngramChat.methods.loadOptions', () => {
 
 		const options = await node.methods.loadOptions.getScopeProperties.call(ctx);
 
-		expect(options.map((o) => o.value)).toEqual([
-			'conversation_id',
-			'session_id',
-			'ticket_id',
-			'user_id',
-		]);
+		expect(options.map((o) => o.value)).toEqual(['conversation_id', 'session_id', 'ticket_id']);
 	});
 });
 
@@ -987,42 +954,6 @@ describe('MemoryWeaviateEngramChat.supplyData', () => {
 
 		const body = parseBody(lastFetchCall().init);
 		expect(body.properties).toEqual({ tenant_id: 'acme' });
-	});
-
-	it('routes a user_id scope row to the top-level user_id, not into properties', async () => {
-		const node = new MemoryWeaviateEngramChat();
-		const scopeName = 'user_id';
-		const ctx = createCtx({
-			userId: '',
-			sessionId: 's1',
-			scopeProperties: [
-				{ name: scopeName, source: 'value', value: 'bob@example.com' },
-				{ name: 'conversation_id', source: 'session' },
-			],
-		});
-
-		const { response } = await node.supplyData.call(ctx, 0);
-		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
-
-		const body = parseBody(lastFetchCall().init);
-		expect(body.user_id).toBe('bob@example.com');
-		expect(body.properties).toEqual({ conversation_id: 's1' });
-	});
-
-	it('prefers the dedicated User ID field over a mapped user_id scope row', async () => {
-		const node = new MemoryWeaviateEngramChat();
-		const scopeName = 'user_id';
-		const ctx = createCtx({
-			userId: 'alice@example.com',
-			sessionId: 's1',
-			scopeProperties: [{ name: scopeName, source: 'value', value: 'bob@example.com' }],
-		});
-
-		const { response } = await node.supplyData.call(ctx, 0);
-		await (response as EngramMemory).chatHistory.addMessage(new HumanMessage('hi'));
-
-		const body = parseBody(lastFetchCall().init);
-		expect(body.user_id).toBe('alice@example.com');
 	});
 
 	it('forwards Group ID and Options into the EngramMemory', async () => {
